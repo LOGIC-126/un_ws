@@ -23,7 +23,7 @@ class Ekf2_link(Node):
         # 参数
         self.declare_parameter('target_frame', 'base_link')
         self.declare_parameter('source_frame', 'map')
-        self.declare_parameter('publish_frequency', 100.0)
+        self.declare_parameter('publish_frequency', 50.0)
         self.declare_parameter('fixed_z', 0.0)
         self.declare_parameter('output_frame_id', 'map')
         self.declare_parameter('tf_timeout_sec', 1.0)          
