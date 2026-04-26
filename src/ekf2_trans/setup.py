@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'ekf2_link = ekf2_trans.ekf2_link:main',
+            'node_px4_imu = ekf2_trans.px4_imu:main',
+            'node_ekf2_link_dds = ekf2_trans.ekf2_link_dds:main',
         ],
     },
 )

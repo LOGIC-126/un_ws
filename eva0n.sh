@@ -8,7 +8,7 @@ echo "设置环境变量..."
 source /opt/ros/humble/setup.bash
 
 ros2 run mavros mavros_node --ros-args \
--p fcu_url:="/dev/ttyS0:921600" \
+-p fcu_url:="/dev/ttyS6:921600" \
 -p time.use_system_time:=true \
 -p time.timesync_mode:="off" \
 -p plugin_allowlist:="['sys_status', 'sys_time', 'imu', 'param', 'command', 'local_position', 'vision_pose','setpoint_position']" \
