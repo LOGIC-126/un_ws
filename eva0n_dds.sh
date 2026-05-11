@@ -13,11 +13,12 @@ sleep 5
 
 echo "启动cartographer..."
 source install/local_setup.sh
-ros2 launch cartographer cartographer_imu_dds.launch.py
+ros2 launch cartographer cartographer_imu_dds.launch.py &
 
 echo "等待节点初始化..."
 sleep 15
 
+echo "start ekf2_link_dds"
 ros2 run ekf2_trans node_ekf2_link_dds
 
 # 当cartographer退出时，杀死所有后台作业
