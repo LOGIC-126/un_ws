@@ -4,7 +4,7 @@ import rclpy
 import math
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Twist
 from px4_msgs.msg import (
     OffboardControlMode, 
     TrajectorySetpoint, 
@@ -52,6 +52,10 @@ class Land_Control(Node):
         self.target_position_subscriber = self.create_subscription(
             Pose, '/uav/target_position', self.target_position_callback, qos_profile)
 
+        # 速度控制接口
+        self.target_velocity_subscriber = self.create_subscription(
+            Twist, '/uav/target_velocity', self.target_velocity_callback, qos_profile)
+
         # Initialize variables
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
@@ -62,9 +66,21 @@ class Land_Control(Node):
         # 修改：初始化目标位姿（默认停留在原点，四元数 w=1 表示偏航角为 0）
         self.target_pose = Pose()
         self.target_pose.orientation.w = 1.0
+        self.target_yaw = 0.0  # 独立于 target_pose.orientation 的 yaw 变量 (弧度)
 
         # 安全标志位
-        self.has_target_altitude = False 
+        self.has_target_altitude = False
+
+        # 速度控制状态
+        self.target_velocity = Twist()
+        self.last_velocity_time = self.get_clock().now()
+        self.velocity_timeout = 0.5  # 无新指令后停止积分 (秒)
+        self.was_velocity_active = False  # 位置→速度激活沿检测
+
+        # 速度限幅
+        self.max_horizontal_speed = 2.0   # m/s
+        self.max_vertical_speed = 1.0     # m/s
+        self.max_yaw_rate = 1.0           # rad/s
 
         # 安全步进参数配置
         self.max_speed = 0.4       # 限制最大期望移动速度 (米/秒)
@@ -90,6 +106,33 @@ class Land_Control(Node):
         """Callback to update target pose from external topic."""
         self.target_pose = msg
         self.has_target_altitude = True
+
+    def target_velocity_callback(self, msg):
+        """Callback to update target velocity from external topic, with safety clamping."""
+        # 水平合速度限幅
+        vx = msg.linear.x
+        vy = msg.linear.y
+        h_speed = math.sqrt(vx * vx + vy * vy)
+        if h_speed > self.max_horizontal_speed:
+            scale = self.max_horizontal_speed / h_speed
+            vx *= scale
+            vy *= scale
+
+        # 垂直速度限幅
+        vz = msg.linear.z
+        if abs(vz) > self.max_vertical_speed:
+            vz = self.max_vertical_speed if vz > 0 else -self.max_vertical_speed
+
+        # 偏航角速度限幅
+        yr = msg.angular.z
+        if abs(yr) > self.max_yaw_rate:
+            yr = self.max_yaw_rate if yr > 0 else -self.max_yaw_rate
+
+        self.target_velocity.linear.x = vx
+        self.target_velocity.linear.y = vy
+        self.target_velocity.linear.z = vz
+        self.target_velocity.angular.z = yr
+        self.last_velocity_time = self.get_clock().now()
 
     def arm(self):
         self.publish_vehicle_command(
@@ -129,6 +172,7 @@ class Land_Control(Node):
         self.trajectory_setpoint_publisher.publish(msg)
         self.get_logger().info("Published position setpoint: [X: {:.2f}, Y: {:.2f}, Z: {:.2f}, Yaw: {:.2f} rad]".format(x, y, z, yaw))
 
+
     def publish_vehicle_command(self, command, **params) -> None:
         msg = VehicleCommand()
         msg.command = command
@@ -160,12 +204,20 @@ class Land_Control(Node):
         return tar_x, tar_y, tar_z
 
     def timer_callback(self) -> None:
-        # 始终持续发布 Offboard 心跳信号
-        self.publish_offboard_control_heartbeat_signal()
-
         battery_percent = self.battery_status.remaining * 100.0
         is_landed = self.vehicle_land_detected.landed
         is_armed = self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED
+        in_offboard = self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
+
+        # 判断速度控制是否激活 (最近 0.5s 内收到过速度指令)
+        now = self.get_clock().now()
+        velocity_active = (
+            in_offboard and is_armed and
+            (now - self.last_velocity_time).nanoseconds * 1e-9 < self.velocity_timeout
+        )
+
+        # 始终发布位置模式心跳 — PX4 侧无模式切换，零抖动
+        self.publish_offboard_control_heartbeat_signal()
 
         # 打印无人机状态
         self.get_logger().info(
@@ -173,7 +225,8 @@ class Land_Control(Node):
             f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
             f"Nav State: {self.vehicle_status.nav_state} | "
             f"Bat: {battery_percent:.1f}% | "
-            f"Landed: {is_landed} | Armed: {is_armed}"
+            f"Landed: {is_landed} | Armed: {is_armed} | "
+            f"Ctrl: {'Velocity' if velocity_active else 'Position'}"
         )
 
         # 建立初始心跳流（PX4 要求切 Offboard 前必须有稳定的心跳）
@@ -181,11 +234,42 @@ class Land_Control(Node):
             self.offboard_setpoint_counter += 1
             return
 
-        # 提取当前目标点的位置与偏航角
+        # —— 速度控制：Python 侧积分速度 → 位置 setpoint ——
+        if velocity_active:
+            dt = self.timer_period  # 0.1s
+
+            # 位置→速度激活瞬间：同步 target_pose 到当前位置，避免从旧航点跳变
+            if not self.was_velocity_active:
+                self.target_pose.position.x = self.vehicle_local_position.x
+                self.target_pose.position.y = self.vehicle_local_position.y
+                self.target_pose.position.z = self.vehicle_local_position.z
+                self.target_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
+                self.was_velocity_active = True
+
+            # 积分速度 → 位置 (NED)
+            self.target_pose.position.x += self.target_velocity.linear.x * dt
+            self.target_pose.position.y += self.target_velocity.linear.y * dt
+            self.target_pose.position.z += self.target_velocity.linear.z * dt
+
+            # 积分偏航角速率
+            self.target_yaw += self.target_velocity.angular.z * dt
+
+            # 发布积分后的位置 setpoint
+            self.publish_position_setpoint(
+                self.target_pose.position.x,
+                self.target_pose.position.y,
+                self.target_pose.position.z,
+                self.target_yaw)
+            return
+
+        self.was_velocity_active = False
+
+        # —— 位置控制 (原有逻辑) ——
         tar_x = self.target_pose.position.x
         tar_y = self.target_pose.position.y
         tar_z = self.target_pose.position.z
         tar_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
+        self.target_yaw = tar_yaw  # 同步 yaw，供下次速度模式使用
 
         # 自动化起飞与降落/上锁逻辑状态机
         if is_landed and not is_armed:
@@ -194,26 +278,21 @@ class Land_Control(Node):
                 self.get_logger().info("Ground & Disarmed. Valid altitude received, triggering Auto-Takeoff...")
                 self.engage_offboard_mode()
                 self.arm()
-        
-        elif self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
+
+        elif in_offboard:
             # 如果在空中处于 Offboard 模式下，且收到 Z 轴目标为 0，则触发降落
             if abs(tar_z) < 0.1:
                 self.get_logger().warn("Airborne & Target Z is close to 0. Triggering Land Mode...")
                 self.land()
             else:
-                # 正常 Offboard 连续飞行状态：运行路径规划器
                 curr_x = self.vehicle_local_position.x
                 curr_y = self.vehicle_local_position.y
                 curr_z = self.vehicle_local_position.z
-
-                # 调用独立的路径规划器
                 cmd_x, cmd_y, cmd_z = self.path_planner(curr_x, curr_y, curr_z, tar_x, tar_y, tar_z)
-
-                # 发布平滑处理后的设定点及外部更改后的偏航角
                 self.publish_position_setpoint(cmd_x, cmd_y, cmd_z, tar_yaw)
 
         # 如果无人机已经着陆且依然处于解锁状态，则自动上锁
-        if is_landed and is_armed and self.vehicle_status.nav_state != VehicleStatus.NAVIGATION_STATE_OFFBOARD:
+        if is_landed and is_armed and not in_offboard:
             self.get_logger().info("Vehicle has touched down. Disarming automatically...")
             self.disarm()
 
