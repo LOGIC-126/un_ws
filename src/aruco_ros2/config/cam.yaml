@@ -1,0 +1,14 @@
+camera_name: "Webcam"
+image_width: 640
+image_height: 480
+distortion_parameters:
+  k1: 0.07910935
+  k2: -0.14167218
+  p1: -0.0030752
+  p2: -0.00107756
+  k3: 0.05718679
+projection_parameters:
+  fx: 306.94344552
+  fy: 305.86926008
+  cx: 327.01283787
+  cy: 236.35170675
