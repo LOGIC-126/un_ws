@@ -27,6 +27,7 @@ setup(
             'node_offboard_control = offboard_control.offboard_control:main',
             'offboard_control_8 = offboard_control.offboard_control_8:main',
             'node_mission = offboard_control.mission:main',
+            'node_competition_mission = offboard_control.competition_mission:main',
         ],
     },
 )
