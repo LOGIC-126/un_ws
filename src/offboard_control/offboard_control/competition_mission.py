@@ -43,9 +43,9 @@ class CompetitionMissionNode(Node):
     # A1-A7 对应网格第1-7行 (y方向), B1-B9 对应网格第1-9列 (x方向)
     # 格式: [('A行号', 'B列号'), ...], 共3组
     DEMO_BARRIERS = [
-        ('A3', 'B4'),
-        ('A4', 'B4'),
-        ('A5', 'B4'),
+        ('A7', 'B3'),
+        ('A7', 'B4'),
+        ('A7', 'B5'),
     ]
 
     TAKE_HEIGHT = -1.2    # 起飞/任务高度 (NED, m)

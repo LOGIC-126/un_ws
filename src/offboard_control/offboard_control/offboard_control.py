@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-双模式机载电脑控制节点
+双模式机载电脑控制节点 (已集成速度期望平滑滤波器)
 
 硬编码可选控制模式 (修改 CONTROL_MODE 常量即可切换):
   "position"     — 模式1: 接收期望位置 → 直接向飞控发送位置 setpoint (PX4 内部位置控制器)
   "velocity_pid" — 模式2: 接收期望位置 → 机载 PID 计算期望速度 → 向飞控发送速度 setpoint
                            接收期望速度 → 直接透传给飞控
-
-两种模式共用:
-  - /uav/target_position  (geometry_msgs/Pose)  期望位置 + 偏航
-  - /uav/target_velocity  (geometry_msgs/Twist)  期望速度 + 偏航角速度
-  - 自动起飞/降落/上锁状态机
-  - 速度指令限幅保护
 """
 
 import rclpy
@@ -38,7 +32,7 @@ CONTROL_MODE_VELOCITY_PID = "velocity_pid"   # 机载 PID → 速度控制
 
 
 class Land_Control(Node):
-    """双模式机载控制节点: 位置直传 / 速度PID"""
+    """双模式机载控制节点: 位置直传 / 速度PID (含一阶低通滤波与加速度限幅)"""
 
     # =======================================================================
     # 硬编码模式 — 修改此行切换控制模式
@@ -54,7 +48,7 @@ class Land_Control(Node):
             f"({'FC position control' if self.CONTROL_MODE == CONTROL_MODE_POSITION else 'Onboard PID → velocity'})"
         )
 
-        # Configure QoS profile for publishing and subscribing
+        # Configure QoS profile
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -84,11 +78,8 @@ class Land_Control(Node):
             VehicleLandDetected, '/fmu/out/vehicle_land_detected',
             self.vehicle_land_detected_callback, qos_profile)
 
-        # 外部目标位姿话题 (位置 + 偏航四元数)
         self.target_position_subscriber = self.create_subscription(
             Pose, '/uav/target_position', self.target_position_callback, qos_profile)
-
-        # 速度控制接口
         self.target_velocity_subscriber = self.create_subscription(
             Twist, '/uav/target_velocity', self.target_velocity_callback, qos_profile)
 
@@ -99,49 +90,59 @@ class Land_Control(Node):
         self.battery_status = BatteryStatus()
         self.vehicle_land_detected = VehicleLandDetected()
 
-        # 目标位姿 (默认原点, 四元数 w=1 表示偏航角为 0)
         self.target_pose = Pose()
         self.target_pose.orientation.w = 1.0
-        self.target_yaw = 0.0  # 独立 yaw 变量 (弧度)
+        self.target_yaw = 0.0
 
-        # 安全标志位
         self.has_target_altitude = False
 
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
         self.last_velocity_time = self.get_clock().now()
-        self.velocity_timeout = 0.5  # 无新指令后回退到位置 PID (秒)
-        self.was_velocity_active = False  # 位置→速度激活沿检测
+        self.velocity_timeout = 0.5
+        self.was_velocity_active = False
 
-        # 速度限幅
-        self.max_horizontal_speed = 2.0   # m/s
-        self.max_vertical_speed = 1.0     # m/s
+        # 速度极限幅值
+        self.max_horizontal_speed = 4.0   # m/s
+        self.max_vertical_speed = 3.0     # m/s
         self.max_yaw_rate = 1.0           # rad/s
 
-        # 安全步进参数配置 (position 模式用)
-        self.max_speed = 0.4       # 限制最大期望移动速度 (米/秒)
-        self.timer_period = 0.05    # 定时器周期 (秒)
+        self.max_speed = 0.4
+        self.timer_period = 0.02          # 50Hz 控制周期
         self.max_step = self.max_speed * self.timer_period
+
+        # ===================================================================
+        # 【新增】平滑滤波器与物理限制参数 (解决蓝线剧烈抖动与尖峰)
+        # ===================================================================
+        # 1. 一阶低通滤波器截止频率 (Hz)，值越小滤波越强，但会带来微小延迟。建议 2.0 - 5.0 Hz
+        self.lpf_cutoff_freq = 3.0 
+        
+        # 2. 最大允许加速度限制 (斜率限制)，防止出现瞬间垂直跳变的尖峰指令
+        self.max_accel_horizontal = 5.0   # m/s^2 
+        self.max_accel_vertical = 4.0     # m/s^2
+        self.max_accel_yaw = 1.5          # rad/s^2
+
+        # 3. 滤波器上一次的输出状态值 (初始化为0)
+        self.filtered_vx = 0.0
+        self.filtered_vy = 0.0
+        self.filtered_vz = 0.0
+        self.filtered_yawspeed = 0.0
 
         # ===================================================================
         # PID 控制器参数 (velocity_pid 模式)
         # ===================================================================
-        # X (NED North) 轴
-        self.kp_x = 0.75
-        self.ki_x = 0.07
-        self.kd_x = 0.1
+        self.kp_x = 1.2
+        self.ki_x = 0.05
+        self.kd_x = 0.25
 
-        # Y (NED East) 轴
-        self.kp_y = 0.75
-        self.ki_y = 0.07
-        self.kd_y = 0.1
+        self.kp_y = 1.2
+        self.ki_y = 0.05
+        self.kd_y = 0.25
 
-        # Z (NED Down / 高度) 轴 — 高度需更快响应
         self.kp_z = 1.2
         self.ki_z = 0.1
         self.kd_z = 0.15
 
-        # Yaw (偏航) 轴
         self.kp_yaw = 1.0
         self.ki_yaw = 0.03
         self.kd_yaw = 0.05
@@ -157,25 +158,22 @@ class Land_Control(Node):
         self.last_error_z = 0.0
         self.last_error_yaw = 0.0
 
-        # 积分饱和上限 (对称限幅)
+        # 积分饱和上限
         self.integral_max_x = self.max_horizontal_speed * 0.3
         self.integral_max_y = self.max_horizontal_speed * 0.3
         self.integral_max_z = self.max_vertical_speed * 0.3
         self.integral_max_yaw = self.max_yaw_rate * 0.3
 
-        # PID 输出上限
         self.max_x_output = self.max_horizontal_speed
         self.max_y_output = self.max_horizontal_speed
         self.max_z_output = self.max_vertical_speed
         self.max_yaw_output = self.max_yaw_rate
 
-        # Create a timer to publish control commands
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
     # ===================================================================
-    # 订阅回调 (与模式无关)
+    # 订阅回调与基础指令方法 (保持不变)
     # ===================================================================
-
     def vehicle_local_position_callback(self, vehicle_local_position):
         self.vehicle_local_position = vehicle_local_position
 
@@ -189,12 +187,10 @@ class Land_Control(Node):
         self.vehicle_land_detected = vehicle_land_detected
 
     def target_position_callback(self, msg):
-        """外部期望位姿回调."""
         self.target_pose = msg
         self.has_target_altitude = True
 
     def target_velocity_callback(self, msg):
-        """外部期望速度回调 (含安全限幅)."""
         vx = msg.linear.x
         vy = msg.linear.y
         h_speed = math.sqrt(vx * vx + vy * vy)
@@ -217,35 +213,23 @@ class Land_Control(Node):
         self.target_velocity.angular.z = yr
         self.last_velocity_time = self.get_clock().now()
 
-    # ===================================================================
-    # 指令方法 (与模式无关)
-    # ===================================================================
-
     def arm(self):
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
         self.get_logger().info('Arm command sent')
 
     def disarm(self):
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         self.get_logger().info('Disarm command sent')
 
     def engage_offboard_mode(self):
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
         self.get_logger().info("Switching to offboard mode")
 
     def land(self):
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self.get_logger().info("Switching to land mode")
 
-    # ===================================================================
-    # 心跳 & 发布 (模式感知)
-    # ===================================================================
-
     def publish_offboard_control_heartbeat_signal(self):
-        """发布 Offboard 心跳 — 根据 CONTROL_MODE 设置控制字."""
         msg = OffboardControlMode()
         if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID:
             msg.position = False
@@ -261,7 +245,6 @@ class Land_Control(Node):
         self.offboard_control_mode_publisher.publish(msg)
 
     def publish_position_setpoint(self, x: float, y: float, z: float, yaw: float):
-        """向飞控发送位置 setpoint (position 模式)."""
         msg = TrajectorySetpoint()
         msg.position = [x, y, z]
         msg.velocity = [float('nan'), float('nan'), float('nan')]
@@ -271,9 +254,7 @@ class Land_Control(Node):
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_publisher.publish(msg)
 
-    def publish_velocity_setpoint(self, vx: float, vy: float, vz: float,
-                                   yawspeed: float = 0.0):
-        """向飞控发送速度 setpoint (velocity_pid 模式)."""
+    def publish_velocity_setpoint(self, vx: float, vy: float, vz: float, yawspeed: float = 0.0):
         msg = TrajectorySetpoint()
         msg.position = [float('nan'), float('nan'), float('nan')]
         msg.velocity = [float(vx), float(vy), float(vz)]
@@ -302,11 +283,11 @@ class Land_Control(Node):
         self.vehicle_command_publisher.publish(msg)
 
     # ===================================================================
-    # PID 控制器 (velocity_pid 模式)
+    # PID 控制器与核心平滑滤波算法
     # ===================================================================
 
     def _reset_pid(self):
-        """重置所有 PID 状态 (在模式切换或长时间不发指令时调用)."""
+        """重置所有 PID 状态与滤波器历史状态."""
         self.integral_x = 0.0
         self.integral_y = 0.0
         self.integral_z = 0.0
@@ -315,45 +296,32 @@ class Land_Control(Node):
         self.last_error_y = 0.0
         self.last_error_z = 0.0
         self.last_error_yaw = 0.0
+        
+        # 同步清空滤波器状态，防止切回时产生跃变
+        self.filtered_vx = self.vehicle_local_position.vx if hasattr(self.vehicle_local_position, 'vx') else 0.0
+        self.filtered_vy = self.vehicle_local_position.vy if hasattr(self.vehicle_local_position, 'vy') else 0.0
+        self.filtered_vz = self.vehicle_local_position.vz if hasattr(self.vehicle_local_position, 'vz') else 0.0
+        self.filtered_yawspeed = 0.0
 
     @staticmethod
     def _yaw_error_wrap(target: float, current: float) -> float:
-        """偏航角误差, 归一化到 [-pi, pi]."""
         err = target - current
-        while err > math.pi:
-            err -= 2.0 * math.pi
-        while err < -math.pi:
-            err += 2.0 * math.pi
+        while err > math.pi: err -= 2.0 * math.pi
+        while err < -math.pi: err += 2.0 * math.pi
         return err
 
-    def _pid_step(self, axis: str, setpoint: float, measurement: float,
-                  dt: float) -> float:
-        """单轴 PID 步进.
-
-        Args:
-            axis: 'x', 'y', 'z', 或 'yaw'.
-            setpoint: 期望值.
-            measurement: 当前测量值.
-            dt: 时间步长 (秒).
-
-        Returns:
-            控制输出 (速度或偏航角速度), 已限幅.
-        """
-        # 偏航轴需要角度 wrapping
+    def _pid_step(self, axis: str, setpoint: float, measurement: float, dt: float) -> float:
         if axis == 'yaw':
             error = self._yaw_error_wrap(setpoint, measurement)
         else:
             error = setpoint - measurement
 
-        # 读取增益
         kp = getattr(self, f'kp_{axis}')
         ki = getattr(self, f'ki_{axis}')
         kd = getattr(self, f'kd_{axis}')
 
-        # 比例项
         p_out = kp * error
 
-        # 积分项 (抗饱和)
         integral = getattr(self, f'integral_{axis}')
         integral += error * dt
         integral_max = getattr(self, f'integral_max_{axis}')
@@ -361,13 +329,11 @@ class Land_Control(Node):
         setattr(self, f'integral_{axis}', integral)
         i_out = ki * integral
 
-        # 微分项 (误差微分)
         last_error = getattr(self, f'last_error_{axis}')
         derivative = (error - last_error) / dt if dt > 0.0 else 0.0
         setattr(self, f'last_error_{axis}', error)
         d_out = kd * derivative
 
-        # PID 合成 + 输出限幅
         output = p_out + i_out + d_out
         max_out = getattr(self, f'max_{axis}_output')
         output = max(-max_out, min(max_out, output))
@@ -375,111 +341,119 @@ class Land_Control(Node):
         return output
 
     # ===================================================================
-    # 辅助方法
+    # 【新增】双重平滑处理函数 (RC低通滤波 + 斜率限制)
     # ===================================================================
+    def _smooth_velocity_setpoints(self, raw_vx: float, raw_vy: float, raw_vz: float, raw_yawspeed: float, dt: float):
+        """
+        对输入的原始速度期望值进行斜率限制（加速度限制）和一阶低通滤波
+        """
+        if dt <= 0.0:
+            return raw_vx, raw_vy, raw_vz, raw_yawspeed
+
+        # ---- 1. 斜率限制 (Slew Rate Limit / 加速度限制) ----
+        max_step_h = self.max_accel_horizontal * dt
+        max_step_v = self.max_accel_vertical * dt
+        max_step_y = self.max_accel_yaw * dt
+
+        # 对一阶输入做跨步限制，消除断点引发的巨大突变脉冲
+        limited_vx = max(self.filtered_vx - max_step_h, min(self.filtered_vx + max_step_h, raw_vx))
+        limited_vy = max(self.filtered_vy - max_step_h, min(self.filtered_vy + max_step_h, raw_vy))
+        limited_vz = max(self.filtered_vz - max_step_v, min(self.filtered_vz + max_step_v, raw_vz))
+        limited_yawspeed = max(self.filtered_yawspeed - max_step_y, min(self.filtered_yawspeed + max_step_y, raw_yawspeed))
+
+        # ---- 2. 一阶低通滤波器 (Low-Pass Filter) ----
+        # 计算滤波系数 alpha = dt / (RC + dt) = dt / (1/(2*pi*fc) + dt)
+        rc = 1.0 / (2.0 * math.pi * self.lpf_cutoff_freq)
+        alpha = dt / (rc + dt)
+        
+        # 严格限制 alpha 在合理的开区间
+        alpha = max(0.01, min(1.0, alpha))
+
+        # 迭代滤波状态，消除高频锯齿
+        self.filtered_vx = (1.0 - alpha) * self.filtered_vx + alpha * limited_vx
+        self.filtered_vy = (1.0 - alpha) * self.filtered_vy + alpha * limited_vy
+        self.filtered_vz = (1.0 - alpha) * self.filtered_vz + alpha * limited_vz
+        self.filtered_yawspeed = (1.0 - alpha) * self.filtered_yawspeed + alpha * limited_yawspeed
+
+        return self.filtered_vx, self.filtered_vy, self.filtered_vz, self.filtered_yawspeed
 
     def quaternion_to_yaw(self, q) -> float:
-        """四元数 → 偏航角 (弧度)."""
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
     def path_planner(self, curr_x: float, curr_y: float, curr_z: float,
                      tar_x: float, tar_y: float, tar_z: float):
-        """路径规划器 (position 模式用), 根据最大步长进行截断插值."""
-        # 当前为直接透传, 可在此处实现步进限幅
         return tar_x, tar_y, tar_z
 
     # ===================================================================
-    # 主定时器回调
+    # 主定时器回调与分发
     # ===================================================================
-
     def timer_callback(self) -> None:
         battery_percent = self.battery_status.remaining * 100.0
         is_landed = self.vehicle_land_detected.landed
         is_armed = self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED
         in_offboard = self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
 
-        # 判断速度控制是否激活 (最近 timeout 秒内收到过 /uav/target_velocity)
         now = self.get_clock().now()
         velocity_active = (
             in_offboard and is_armed and
             (now - self.last_velocity_time).nanoseconds * 1e-9 < self.velocity_timeout
         )
 
-        # 发布模式感知心跳
         self.publish_offboard_control_heartbeat_signal()
 
-        # 状态日志
         mode_label = 'Vel-PID' if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID else 'Pos'
         cmd_label = 'DirectVel' if velocity_active else mode_label
         self.get_logger().info(
             f"--- UAV STATUS --- "
-            f"Pos: [X: {self.vehicle_local_position.x:.2f}, "
-            f"Y: {self.vehicle_local_position.y:.2f}, "
-            f"Z: {self.vehicle_local_position.z:.2f}] | "
-            f"Hdg: {self.vehicle_local_position.heading:.2f} | "
+            f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
             f"Nav State: {self.vehicle_status.nav_state} | "
-            f"Bat: {battery_percent:.1f}% | "
-            f"Landed: {is_landed} | Armed: {is_armed} | "
             f"Ctrl: {cmd_label}"
         )
 
-        # 建立初始心跳流 (PX4 要求切 Offboard 前有稳定心跳)
         if self.offboard_setpoint_counter < 10:
             self.offboard_setpoint_counter += 1
             return
 
-        # 根据模式分发
         if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID:
-            self._timer_velocity_pid_mode(
-                is_landed, is_armed, in_offboard, velocity_active)
+            self._timer_velocity_pid_mode(is_landed, is_armed, in_offboard, velocity_active)
         else:
-            self._timer_position_mode(
-                is_landed, is_armed, in_offboard, velocity_active)
+            self._timer_position_mode(is_landed, is_armed, in_offboard, velocity_active)
 
     # ===================================================================
-    # 模式: velocity_pid — 机载 PID → 速度 setpoint
+    # 核心修改：在发送给飞控前，对计算出的速度进行平滑拦截
     # ===================================================================
-
     def _timer_velocity_pid_mode(self, is_landed: bool, is_armed: bool,
                                   in_offboard: bool, velocity_active: bool):
-        """Velocity PID 模式定时器逻辑."""
         tar_z = self.target_pose.position.z
         dt = self.timer_period
 
-        # —— 状态机: 自动起飞 / 降落 / 上锁 ——
         if is_landed and not is_armed:
-            # 地面未解锁: 收到有效高度 → 自动起飞
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                self.get_logger().info(
-                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
+                self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self._reset_pid()
                 self.engage_offboard_mode()
                 self.arm()
 
         elif in_offboard:
             if abs(tar_z) < 0.05:
-                # 目标 Z≈0 → 降落
-                self.get_logger().warn(
-                    "Airborne & Target Z≈0. Triggering Land Mode...")
+                self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:
-                # —— 核心控制 ——
+                # —— 核心控制分发 ——
                 if velocity_active:
-                    # ★ 直接速度透传
+                    # 1. 外部直接速度透传模式
                     if not self.was_velocity_active:
-                        self._reset_pid()  # 切到透传时清零积分
+                        self._reset_pid()
                         self.was_velocity_active = True
 
-                    self.publish_velocity_setpoint(
-                        self.target_velocity.linear.x,
-                        self.target_velocity.linear.y,
-                        self.target_velocity.linear.z,
-                        self.target_velocity.angular.z)
-
+                    raw_vx = self.target_velocity.linear.x
+                    raw_vy = self.target_velocity.linear.y
+                    raw_vz = self.target_velocity.linear.z
+                    raw_yr = self.target_velocity.angular.z
                 else:
-                    # ★ 位置 PID → 速度
+                    # 2. 机载位置 PID 计算期望速度模式
                     self.was_velocity_active = False
 
                     curr_x = self.vehicle_local_position.x
@@ -492,47 +466,45 @@ class Land_Control(Node):
                     tar_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
                     self.target_yaw = tar_yaw
 
-                    # PID 计算各轴期望速度
-                    vx = self._pid_step('x', tar_x, curr_x, dt)
-                    vy = self._pid_step('y', tar_y, curr_y, dt)
-                    vz = self._pid_step('z', tar_z, curr_z, dt)
-                    yawspeed = self._pid_step('yaw', tar_yaw, curr_yaw, dt)
+                    # 原始突变/带噪 PID 期望输出
+                    raw_vx = self._pid_step('x', tar_x, curr_x, dt)
+                    raw_vy = self._pid_step('y', tar_y, curr_y, dt)
+                    raw_vz = self._pid_step('z', tar_z, curr_z, dt)
+                    raw_yr = self._pid_step('yaw', tar_yaw, curr_yaw, dt)
 
-                    self.publish_velocity_setpoint(vx, vy, vz, yawspeed)
+                # ===========================================================
+                # 【拦截点】不管哪种速度源，发送前均进行物理平滑与滤波处理
+                # ===========================================================
+                smooth_vx, smooth_vy, smooth_vz, smooth_yr = self._smooth_velocity_setpoints(
+                    raw_vx, raw_vy, raw_vz, raw_yr, dt
+                )
 
-        # 着陆后自动上锁
+                # 发布平滑后的蓝线指令给飞控
+                self.publish_velocity_setpoint(smooth_vx, smooth_vy, smooth_vz, smooth_yr)
+
         if is_landed and is_armed and not in_offboard:
             self.get_logger().info("Touched down. Disarming...")
             self._reset_pid()
             self.disarm()
 
-    # ===================================================================
-    # 模式: position — 向飞控直发位置 setpoint (原有逻辑)
-    # ===================================================================
-
     def _timer_position_mode(self, is_landed: bool, is_armed: bool,
-                              in_offboard: bool, velocity_active: bool):
-        """Position 模式定时器逻辑 (保持原有行为)."""
+                             in_offboard: bool, velocity_active: bool):
+        # 保持原有行为不变
         tar_x = self.target_pose.position.x
         tar_y = self.target_pose.position.y
         tar_z = self.target_pose.position.z
         tar_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
-        self.target_yaw = tar_yaw  # 同步 yaw
+        self.target_yaw = tar_yaw
 
-        # —— 速度控制: Python 侧积分速度 → 位置 setpoint ——
         if velocity_active:
             dt = self.timer_period
-
-            # 位置→速度激活瞬间: 同步 target_pose 到当前位置
             if not self.was_velocity_active:
                 self.target_pose.position.x = self.vehicle_local_position.x
                 self.target_pose.position.y = self.vehicle_local_position.y
                 self.target_pose.position.z = self.vehicle_local_position.z
-                self.target_yaw = self.quaternion_to_yaw(
-                    self.target_pose.orientation)
+                self.target_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
                 self.was_velocity_active = True
 
-            # 积分速度 → 位置 (NED)
             self.target_pose.position.x += self.target_velocity.linear.x * dt
             self.target_pose.position.y += self.target_velocity.linear.y * dt
             self.target_pose.position.z += self.target_velocity.linear.z * dt
@@ -547,19 +519,15 @@ class Land_Control(Node):
 
         self.was_velocity_active = False
 
-        # —— 位置控制 (原有逻辑) ——
-        # 自动起飞/降落/上锁状态机
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                self.get_logger().info(
-                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
+                self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self.engage_offboard_mode()
                 self.arm()
 
         elif in_offboard:
             if abs(tar_z) < 0.05:
-                self.get_logger().warn(
-                    "Airborne & Target Z≈0. Triggering Land Mode...")
+                self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:
                 curr_x = self.vehicle_local_position.x
