@@ -115,7 +115,7 @@ class Land_Control(Node):
         # 【新增】平滑滤波器与物理限制参数 (解决蓝线剧烈抖动与尖峰)
         # ===================================================================
         # 1. 一阶低通滤波器截止频率 (Hz)，值越小滤波越强，但会带来微小延迟。建议 2.0 - 5.0 Hz
-        self.lpf_cutoff_freq = 3.0 
+        self.lpf_cutoff_freq = 6.0 
         
         # 2. 最大允许加速度限制 (斜率限制)，防止出现瞬间垂直跳变的尖峰指令
         self.max_accel_horizontal = 5.0   # m/s^2 
@@ -133,11 +133,11 @@ class Land_Control(Node):
         # ===================================================================
         self.kp_x = 1.2
         self.ki_x = 0.05
-        self.kd_x = 0.25
+        self.kd_x = 0.45
 
         self.kp_y = 1.2
         self.ki_y = 0.05
-        self.kd_y = 0.25
+        self.kd_y = 0.45
 
         self.kp_z = 1.2
         self.ki_z = 0.1
