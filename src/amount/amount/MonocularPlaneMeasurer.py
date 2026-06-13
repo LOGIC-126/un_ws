@@ -23,8 +23,8 @@ class MonocularPlaneMeasurer:
         
         # 旋转解耦参数（根据相机内参和焦距计算，需要标定）
         # 每1角度对应的像素个数，与分辨率和焦距有关
-        self.pixel_per_deg_x = 5.3  # 需要实际标定
-        self.pixel_per_deg_y = 5.3  # 需要实际标定
+        self.pixel_per_deg_x = 5.36  # 需要实际标定
+        self.pixel_per_deg_y = 5.34  # 需要实际标定
         
         
         print(f"相机参数初始化:")
@@ -71,8 +71,8 @@ class MonocularPlaneMeasurer:
         返回: (X, Y) 世界坐标 (米)
         """
         # 计算归一化坐标
-        x_norm = (u - self.cx) / self.fx
-        y_norm = (v - self.cy) / self.fy
+        x_norm = (self.cx - u) / self.fx
+        y_norm = (self.cy - v) / self.fy
         
         # 计算世界坐标
         X = x_norm * Z
