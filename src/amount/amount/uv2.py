@@ -1,6 +1,6 @@
 """
-接收UDP检测结果，使用单目平面测量模块计算目标在相机坐标系下的位置，
-同时读取并定期打印无人机欧拉角，平面距离硬编码为 0.55 米。
+接收UDP检测结果，使用单目平面测量模块计算目标在相机坐标系和全局世界坐标系下的位置，
+同时读取并定期打印无人机欧拉角。平面距离硬编码。
 """
 import socket
 import json
@@ -11,16 +11,15 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import VehicleAttitude
+from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
 
-# 导入单目测量模块（与代码1相同的路径）
 from amount.MonocularPlaneMeasurer import MonocularPlaneMeasurer
 
 # ============ 配置 ============
 UDP_HOST = '127.0.0.1'
 UDP_PORT = 8888
 BUFFER_SIZE = 4096
-PLANE_DISTANCE = 0.90          # 硬编码的相机到平面距离（米）
+PLANE_DISTANCE = 0.86          # 硬编码的相机到平面距离（米）
 USE_UNDISTORT = True           # 是否进行畸变校正
 
 CLASSES = ["elephant", "tiger", "wolf", "monkey", "peacock"]
@@ -35,11 +34,7 @@ DIST_COEFFS = np.array([0.07910935, -0.14167218, -0.0030752, -0.00107756, 0.0571
 
 
 def quaternion_to_euler(q):
-    """
-    从四元数提取欧拉角
-    参数 q: (x, y, z, w) 顺序
-    返回: (roll_deg, pitch_deg, yaw_rad)
-    """
+    """四元数 -> 欧拉角 (roll_deg, pitch_deg, yaw_rad)"""
     x, y, z, w = q
     roll_rad  = math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
     pitch_rad = math.asin(max(-1.0, min(1.0, 2*(w*y - z*x))))
@@ -52,21 +47,21 @@ class MocMea_Node(Node):
     def __init__(self):
         super().__init__('monocular_measurement_node')
 
-        # ---- 单目平面测量器 ----
         self.measurer = MonocularPlaneMeasurer(CAMERA_MATRIX, DIST_COEFFS)
 
         # ---- UDP ----
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.settimeout(1.0)
         self.udp_running = True
-
         self.udp_thread = threading.Thread(target=self._udp_loop, daemon=True)
         self.udp_thread.start()
 
-        # ---- 姿态订阅 ----
-        self.drone_attitude_quat = None   # 存储顺序: (x, y, z, w)
-        self.attitude_lock = threading.Lock()
+        # ---- 状态锁与存储 ----
+        self.state_lock = threading.Lock()
+        self.drone_position = None           # (x, y, z)
+        self.drone_attitude_quat = None      # (x, y, z, w)
 
+        # ---- QoS ----
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -74,6 +69,15 @@ class MocMea_Node(Node):
             depth=1
         )
 
+        # ---- 位置订阅 ----
+        self.position_sub = self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position_v1',
+            self._position_callback,
+            qos_profile
+        )
+
+        # ---- 姿态订阅 ----
         self.attitude_sub = self.create_subscription(
             VehicleAttitude,
             '/fmu/out/vehicle_attitude',
@@ -81,30 +85,28 @@ class MocMea_Node(Node):
             qos_profile
         )
 
-        # 1 Hz 打印欧拉角定时器
+        # 1 Hz 打印欧拉角
         self.euler_timer = self.create_timer(1.0, self._print_euler_callback)
 
         self.get_logger().info(f'UDP监听启动: {UDP_HOST}:{UDP_PORT}')
         self.get_logger().info(f'平面距离硬编码: {PLANE_DISTANCE} m, 畸变校正: {USE_UNDISTORT}')
-        self.get_logger().info('姿态订阅已启动，1Hz 欧拉角打印已就绪')
+        self.get_logger().info('位置/姿态订阅已启动，1Hz 欧拉角打印已就绪')
 
-    # -------------------- 姿态回调 --------------------
+    # -------------------- 回调 --------------------
+    def _position_callback(self, msg):
+        with self.state_lock:
+            self.drone_position = (msg.x, msg.y, msg.z)
+
     def _attitude_callback(self, msg):
-        """
-        接收 VehicleAttitude，内部存储为 (x, y, z, w)
-        """
         w, x, y, z = msg.q
-        with self.attitude_lock:
+        with self.state_lock:
             self.drone_attitude_quat = (x, y, z, w)
 
-    # -------------------- 定时打印欧拉角 --------------------
     def _print_euler_callback(self):
-        """每秒打印一次当前欧拉角（roll, pitch, yaw）"""
-        with self.attitude_lock:
+        with self.state_lock:
             quat = self.drone_attitude_quat
         if quat is None:
             return
-
         roll_deg, pitch_deg, yaw_rad = quaternion_to_euler(quat)
         yaw_deg = math.degrees(yaw_rad)
         self.get_logger().info(
@@ -138,20 +140,19 @@ class MocMea_Node(Node):
         if not detections:
             return
 
-        # 获取当前姿态（欧拉角）
-        with self.attitude_lock:
+        # 获取位姿
+        with self.state_lock:
+            pos = self.drone_position
             quat = self.drone_attitude_quat
+
         if quat is not None:
-            roll_deg, pitch_deg, _ = quaternion_to_euler(quat)
+            roll_deg, pitch_deg, yaw_rad = quaternion_to_euler(quat)
         else:
-            roll_deg, pitch_deg = 0.0, 0.0
+            roll_deg, pitch_deg, yaw_rad = 0.0, 0.0, 0.0
 
         for det in detections:
             class_id = det.get('class_id', -1)
-            if 0 <= class_id < len(CLASSES):
-                class_name = CLASSES[class_id]
-            else:
-                class_name = f"unk({class_id})"
+            class_name = CLASSES[class_id] if 0 <= class_id < len(CLASSES) else f"unk({class_id})"
 
             # 中心像素坐标
             if 'center' in det:
@@ -160,7 +161,7 @@ class MocMea_Node(Node):
                 x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
-            # ---------- 使用单目平面测量模块计算相机坐标系下的世界坐标 ----------
+            # 相机坐标系位置（X右 Y下）
             try:
                 X_cam, Y_cam = self.measurer.pixel_to_world_with_decoupling(
                     cx, cy,
@@ -169,14 +170,30 @@ class MocMea_Node(Node):
                     pitch_deg=pitch_deg,
                     use_undistort=USE_UNDISTORT
                 )
-                coord_str = f"(X={X_cam:+.3f}, Y={Y_cam:+.3f}) m  (相机坐标系: X右 Y下)"
             except Exception as e:
-                self.get_logger().error(f'坐标转换失败: {e}')
-                coord_str = "计算失败"
+                self.get_logger().error(f'像素→相机坐标失败: {e}')
+                continue
 
-            self.get_logger().info(
-                f'{class_name} 像素({cx:.1f}, {cy:.1f}) → 相机坐标 {coord_str}'
-            )
+            # 全局世界坐标（需要位置和航向）
+            global_str = "无位置/姿态"
+        if pos is not None and quat is not None:
+            cos_y = math.cos(yaw_rad)
+            sin_y = math.sin(yaw_rad)
+            global_x = pos[0] + Y_cam * cos_y + X_cam * sin_y
+            global_y = pos[1] + Y_cam * sin_y - X_cam * cos_y
+            global_str = f"({global_x:+.3f}, {global_y:+.3f}) m"
+
+        if pos is not None:
+            yaw_deg = math.degrees(yaw_rad)
+            pos_str = f'无人机({pos[0]:.3f}, {pos[1]:.3f}) 偏航={yaw_deg:.1f}°'
+        else:
+            pos_str = '无人机位置未知'
+
+        self.get_logger().info(
+            f'{class_name} 像素({cx:.1f}, {cy:.1f}) → '
+            f'相机(X={X_cam:+.3f}, Y={Y_cam:+.3f}) m | '
+            f'世界 {global_str} | {pos_str}'
+)
 
     # -------------------- 关闭 --------------------
     def stop(self):
