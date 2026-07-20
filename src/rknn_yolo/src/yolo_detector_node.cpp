@@ -1,4 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <cv_bridge/cv_bridge.h>
+
 #include <vision_msgs/msg/detection2_d_array.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
 #include <vision_msgs/msg/object_hypothesis_with_pose.hpp>
@@ -27,6 +30,10 @@ static const std::vector<std::string> CLASSES = {"elephant", "tiger", "wolf", "m
 static const int NC = CLASSES.size();
 static const int REG_MAX = 16;
 static const std::vector<int> STRIDES = {8, 16, 32};
+
+// ---------- 新增：模式配置 ----------
+static const bool USE_CAMERA = false;        // true: 使用硬件摄像头, false: 订阅话题
+static const std::string IMAGE_TOPIC = "/camera/color/image_raw";   // 话题模式下的订阅话题
 
 // ========== 后处理函数 ==========
 static void dfl_decode(const float* box_raw, int h, int w, float* decoded) {
@@ -188,9 +195,9 @@ post_process(const std::vector<rknn_output>& outputs,
 class YoloDetector : public rclcpp::Node {
 public:
     YoloDetector() : Node("yolo_detector_node") {
-        // 只发布检测结果，不再发布图像
         detection_pub_ = this->create_publisher<vision_msgs::msg::Detection2DArray>("detections", 10);
 
+        // 初始化 RKNN
         int ret = rknn_init(&ctx_, const_cast<char*>(RKNN_MODEL.c_str()), 0, 0, nullptr);
         if (ret < 0) {
             RCLCPP_ERROR(this->get_logger(), "rknn_init failed! ret=%d", ret);
@@ -233,34 +240,58 @@ public:
             }
         }
 
-        cap_.open(0);
-        if (!cap_.isOpened()) {
-            RCLCPP_ERROR(this->get_logger(), "Cannot open camera /dev/video0");
-            rclcpp::shutdown();
-            return;
-        }
-        cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-
-        // 创建 OpenCV 窗口
+        // ---------- 根据模式初始化输入源 ----------
         cv::namedWindow("object", cv::WINDOW_NORMAL);
 
-        timer_ = this->create_wall_timer(30ms, std::bind(&YoloDetector::process_frame, this));
-        RCLCPP_INFO(this->get_logger(), "YOLOv8 detector started. Publishing detections and displaying image.");
+        if (USE_CAMERA) {
+            // 硬件摄像头模式
+            cap_.open(0);
+            if (!cap_.isOpened()) {
+                RCLCPP_ERROR(this->get_logger(), "Cannot open camera /dev/video0");
+                rclcpp::shutdown();
+                return;
+            }
+            cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+
+            timer_ = this->create_wall_timer(30ms, std::bind(&YoloDetector::camera_callback, this));
+            RCLCPP_INFO(this->get_logger(), "Running in CAMERA mode. Publishing detections and displaying image.");
+        } else {
+            // 话题订阅模式
+            image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+                IMAGE_TOPIC, rclcpp::SensorDataQoS(), 
+                std::bind(&YoloDetector::image_callback, this, std::placeholders::_1));
+            RCLCPP_INFO(this->get_logger(), "Running in TOPIC mode. Subscribing to '%s'.", IMAGE_TOPIC.c_str());
+        }
     }
 
     ~YoloDetector() {
         if (ctx_) rknn_destroy(ctx_);
-        cap_.release();
+        if (cap_.isOpened()) cap_.release();
         cv::destroyAllWindows();
     }
 
 private:
-    void process_frame() {
+    // ---------- 摄像头定时器回调 ----------
+    void camera_callback() {
         cv::Mat frame;
         cap_ >> frame;
         if (frame.empty()) return;
+        process_image(frame);
+    }
 
+    // ---------- 话题订阅回调 ----------
+    void image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
+        try {
+            cv::Mat frame = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8)->image;
+            process_image(frame);
+        } catch (cv_bridge::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+        }
+    }
+
+    // ---------- 核心处理函数 ----------
+    void process_image(cv::Mat frame) {
         int img_h = frame.rows, img_w = frame.cols;
 
         cv::Mat rgb;
@@ -327,7 +358,7 @@ private:
         }
         detection_pub_->publish(*det_msg);
 
-        // ---------- 绘制图像并显示（使用 cv::imshow） ----------
+        // ---------- 绘制并显示图像 ----------
         cv::Mat display_frame = frame.clone();
         for (size_t i = 0; i < boxes.size(); i++) {
             const auto& box = boxes[i];
@@ -352,13 +383,15 @@ private:
         }
 
         cv::imshow("object", display_frame);
-        cv::waitKey(1);   // 必须调用，否则窗口不更新
+        cv::waitKey(1);
 
         rknn_outputs_release(ctx_, n_outputs_, outputs.data());
     }
 
+    // ---------- 成员变量 ----------
     rclcpp::Publisher<vision_msgs::msg::Detection2DArray>::SharedPtr detection_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;  // 新增话题订阅
     cv::VideoCapture cap_;
 
     rknn_context ctx_ = 0;

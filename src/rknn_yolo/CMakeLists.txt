@@ -12,6 +12,7 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(vision_msgs REQUIRED)   # 新增：用于 Detection2DArray
 
 # RKNN 头文件路径
 include_directories(
@@ -21,27 +22,41 @@ include_directories(
 
 link_directories(/usr/lib)
 
-# 编译可执行文件
+# ========== 原 YOLO 检测节点 ==========
 add_executable(yolo_detector_node
   src/yolo_detector_node.cpp
 )
 
-# 链接 ROS 2 依赖
 ament_target_dependencies(yolo_detector_node
   rclcpp
   std_msgs
   sensor_msgs
   cv_bridge
+  vision_msgs        # 新增
 )
 
-# 链接 RKNN 和 OpenCV
 target_link_libraries(yolo_detector_node
   rknnrt
   ${OpenCV_LIBS}
 )
 
+# ========== 摄像头发布节点（保持原样）==========
+add_executable(camera_publisher_node
+  src/camera_node.cpp
+)
+
+ament_target_dependencies(camera_publisher_node
+  rclcpp
+  sensor_msgs
+  cv_bridge
+)
+
+target_link_libraries(camera_publisher_node
+  ${OpenCV_LIBS}
+)
+
 # 安装规则
-install(TARGETS yolo_detector_node
+install(TARGETS yolo_detector_node camera_publisher_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
