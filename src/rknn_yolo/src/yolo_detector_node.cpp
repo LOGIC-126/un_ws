@@ -1,6 +1,9 @@
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <cv_bridge/cv_bridge.h>
+#include <vision_msgs/msg/detection2_d_array.hpp>
+#include <vision_msgs/msg/detection2_d.hpp>
+#include <vision_msgs/msg/object_hypothesis_with_pose.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/point.hpp>
 
 #include <opencv2/opencv.hpp>
 #include <rknn_api.h>
@@ -25,18 +28,11 @@ static const int NC = CLASSES.size();
 static const int REG_MAX = 16;
 static const std::vector<int> STRIDES = {8, 16, 32};
 
-// ========== 后处理工具函数 ==========
-
-/**
- * DFL 解码：将 box_raw (形状 [1, 64, h, w], 即 4*REG_MAX 通道) 解码为边界框偏移量
- * 输出 decoded 形状为 [4 * h * w]，按顺序存储 lt_x, lt_y, rb_x, rb_y (每个平面 h*w 个值)
- */
+// ========== 后处理函数 ==========
 static void dfl_decode(const float* box_raw, int h, int w, float* decoded) {
     int spatial = h * w;
-    // 对每个坐标分量分别进行 softmax + 加权求和
     for (int coord = 0; coord < 4; coord++) {
         for (int j = 0; j < spatial; j++) {
-            // 找到最大值用于数值稳定性
             float max_val = -1e9;
             for (int k = 0; k < REG_MAX; k++) {
                 float v = box_raw[(coord * REG_MAX + k) * spatial + j];
@@ -57,37 +53,30 @@ static void dfl_decode(const float* box_raw, int h, int w, float* decoded) {
     }
 }
 
-/**
- * 完整后处理：返回检测框 [x1,y1,x2,y2] 在原图尺寸下的坐标，置信度，类别ID
- */
-static std::tuple<std::vector<std::vector<int>>, std::vector<float>, std::vector<int>>
+static std::tuple<std::vector<std::vector<float>>, std::vector<float>, std::vector<int>>
 post_process(const std::vector<rknn_output>& outputs,
              const std::vector<rknn_tensor_attr>& output_attrs,
              int img_w, int img_h)
 {
-    std::vector<std::vector<float>> all_boxes;  // [cx,cy,w,h]
+    std::vector<std::vector<float>> all_boxes;
     std::vector<float> all_scores;
     std::vector<int> all_cls;
 
     for (int i = 0; i < 3; i++) {
         int stride = STRIDES[i];
 
-        // 获取三个输出张量：box, cls, sum
         const rknn_output& box_out   = outputs[i*3];
         const rknn_output& cls_out   = outputs[i*3+1];
         const rknn_output& sum_out   = outputs[i*3+2];
 
-        // 获取当前输出的维度（NCHW 格式）
-        const rknn_tensor_attr& box_attr = output_attrs[i*3];
-        const rknn_tensor_attr& cls_attr = output_attrs[i*3+1];
-        const rknn_tensor_attr& sum_attr = output_attrs[i*3+2];
+        (void)output_attrs[i*3+1];
+        (void)output_attrs[i*3+2];
 
-        // 期望 box: [1, 64, h, w], cls: [1, NC, h, w], sum: [1, 1, h, w]
+        const rknn_tensor_attr& box_attr = output_attrs[i*3];
         int h = box_attr.dims[2];
         int w = box_attr.dims[3];
         int spatial = h * w;
 
-        // DFL 解码得到 lt_x, lt_y, rb_x, rb_y 四个平面，每个平面尺寸 h*w
         std::vector<float> decoded(4 * spatial);
         dfl_decode((const float*)box_out.buf, h, w, decoded.data());
 
@@ -99,7 +88,6 @@ post_process(const std::vector<rknn_output>& outputs,
         const float* cls_data = (const float*)cls_out.buf;
         const float* sum_data = (const float*)sum_out.buf;
 
-        // 生成网格
         std::vector<float> gx(spatial), gy(spatial);
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
@@ -109,18 +97,15 @@ post_process(const std::vector<rknn_output>& outputs,
             }
         }
 
-        // 遍历每个位置，计算边界框并过滤
         for (int idx = 0; idx < spatial; idx++) {
             float obj_score = sum_data[idx];
             if (obj_score <= OBJ_THRESH) continue;
 
-            // 转换为原图坐标系 (cx,cy,w,h)
             float cx = ((gx[idx] - lt_x[idx]) + (gx[idx] + rb_x[idx])) / 2.0f * stride;
             float cy = ((gy[idx] - lt_y[idx]) + (gy[idx] + rb_y[idx])) / 2.0f * stride;
             float bw = ((gx[idx] + rb_x[idx]) - (gx[idx] - lt_x[idx])) * stride;
             float bh = ((gy[idx] + rb_y[idx]) - (gy[idx] - lt_y[idx])) * stride;
 
-            // 找出最大类别得分
             float max_cls_score = -1.0f;
             int best_cls = -1;
             for (int c = 0; c < NC; c++) {
@@ -138,8 +123,7 @@ post_process(const std::vector<rknn_output>& outputs,
         }
     }
 
-    // NMS（类别无关）
-    std::vector<std::vector<int>> final_boxes;
+    std::vector<std::vector<float>> final_boxes;
     std::vector<float> final_scores;
     std::vector<int> final_cls_ids;
 
@@ -159,7 +143,6 @@ post_process(const std::vector<rknn_output>& outputs,
         areas[i] = (x2[i] - x1[i]) * (y2[i] - y1[i]);
     }
 
-    // 按置信度降序排序索引
     std::vector<int> order(num);
     for (int i = 0; i < (int)num; i++) order[i] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) {
@@ -170,8 +153,7 @@ post_process(const std::vector<rknn_output>& outputs,
     for (size_t i = 0; i < num; i++) {
         int idx_i = order[i];
         if (suppressed[idx_i]) continue;
-        final_boxes.push_back({static_cast<int>(x1[idx_i]), static_cast<int>(y1[idx_i]),
-                               static_cast<int>(x2[idx_i]), static_cast<int>(y2[idx_i])});
+        final_boxes.push_back({x1[idx_i], y1[idx_i], x2[idx_i], y2[idx_i]});
         final_scores.push_back(all_scores[idx_i]);
         final_cls_ids.push_back(all_cls[idx_i]);
         for (size_t j = i + 1; j < num; j++) {
@@ -190,14 +172,13 @@ post_process(const std::vector<rknn_output>& outputs,
         }
     }
 
-    // 映射回原始图像尺寸
     float sx = (float)img_w / IMG_SIZE;
     float sy = (float)img_h / IMG_SIZE;
     for (auto& box : final_boxes) {
-        box[0] = static_cast<int>(box[0] * sx);
-        box[1] = static_cast<int>(box[1] * sy);
-        box[2] = static_cast<int>(box[2] * sx);
-        box[3] = static_cast<int>(box[3] * sy);
+        box[0] *= sx;
+        box[1] *= sy;
+        box[2] *= sx;
+        box[3] *= sy;
     }
 
     return {final_boxes, final_scores, final_cls_ids};
@@ -207,10 +188,9 @@ post_process(const std::vector<rknn_output>& outputs,
 class YoloDetector : public rclcpp::Node {
 public:
     YoloDetector() : Node("yolo_detector_node") {
-        // 创建图像发布者
-        image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("detection_image", 10);
+        // 只发布检测结果，不再发布图像
+        detection_pub_ = this->create_publisher<vision_msgs::msg::Detection2DArray>("detections", 10);
 
-        // 初始化 RKNN
         int ret = rknn_init(&ctx_, const_cast<char*>(RKNN_MODEL.c_str()), 0, 0, nullptr);
         if (ret < 0) {
             RCLCPP_ERROR(this->get_logger(), "rknn_init failed! ret=%d", ret);
@@ -218,7 +198,6 @@ public:
             return;
         }
 
-        // 查询输入输出数量
         rknn_input_output_num io_num;
         ret = rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
         if (ret != 0) {
@@ -232,7 +211,6 @@ public:
             RCLCPP_WARN(this->get_logger(), "Expected 9 output tensors, got %d. Adjust post-process.", n_outputs_);
         }
 
-        // 获取输入属性
         input_attrs_.resize(n_inputs_);
         for (int i = 0; i < n_inputs_; i++) {
             input_attrs_[i].index = i;
@@ -244,7 +222,6 @@ public:
             }
         }
 
-        // 获取输出属性
         output_attrs_.resize(n_outputs_);
         for (int i = 0; i < n_outputs_; i++) {
             output_attrs_[i].index = i;
@@ -256,7 +233,6 @@ public:
             }
         }
 
-        // 打开摄像头
         cap_.open(0);
         if (!cap_.isOpened()) {
             RCLCPP_ERROR(this->get_logger(), "Cannot open camera /dev/video0");
@@ -266,14 +242,17 @@ public:
         cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640);
         cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-        // 定时器驱动（约 30 fps）
+        // 创建 OpenCV 窗口
+        cv::namedWindow("object", cv::WINDOW_NORMAL);
+
         timer_ = this->create_wall_timer(30ms, std::bind(&YoloDetector::process_frame, this));
-        RCLCPP_INFO(this->get_logger(), "YOLOv8 detector started. Publishing to /detection_image");
+        RCLCPP_INFO(this->get_logger(), "YOLOv8 detector started. Publishing detections and displaying image.");
     }
 
     ~YoloDetector() {
         if (ctx_) rknn_destroy(ctx_);
         cap_.release();
+        cv::destroyAllWindows();
     }
 
 private:
@@ -284,13 +263,11 @@ private:
 
         int img_h = frame.rows, img_w = frame.cols;
 
-        // 预处理：BGR -> RGB, resize to 640x640, keep as uint8 NHWC
         cv::Mat rgb;
         cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
         cv::Mat resized;
         cv::resize(rgb, resized, cv::Size(IMG_SIZE, IMG_SIZE));
 
-        // 设置输入
         rknn_input inputs[1];
         memset(inputs, 0, sizeof(inputs));
         inputs[0].index = 0;
@@ -305,14 +282,12 @@ private:
             return;
         }
 
-        // 推理
         ret = rknn_run(ctx_, nullptr);
         if (ret < 0) {
             RCLCPP_ERROR(this->get_logger(), "rknn_run failed! ret=%d", ret);
             return;
         }
 
-        // 获取输出（转为 float）
         std::vector<rknn_output> outputs(n_outputs_);
         memset(outputs.data(), 0, sizeof(rknn_output) * n_outputs_);
         for (int i = 0; i < n_outputs_; i++) {
@@ -324,53 +299,65 @@ private:
             return;
         }
 
-        // 后处理
         auto [boxes, scores, cls_ids] = post_process(outputs, output_attrs_, img_w, img_h);
 
-        // 绘制检测框到原始帧
+        // ---------- 发布 Detection2DArray ----------
+        auto det_msg = std::make_shared<vision_msgs::msg::Detection2DArray>();
+        det_msg->header.stamp = this->get_clock()->now();
+        det_msg->header.frame_id = "camera";
+
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            vision_msgs::msg::Detection2D detection;
+            detection.header = det_msg->header;
+
+            float x1 = boxes[i][0], y1 = boxes[i][1];
+            float x2 = boxes[i][2], y2 = boxes[i][3];
+
+            detection.bbox.center.position.x = (x1 + x2) / 2.0f;
+            detection.bbox.center.position.y = (y1 + y2) / 2.0f;
+            detection.bbox.size_x = x2 - x1;
+            detection.bbox.size_y = y2 - y1;
+
+            vision_msgs::msg::ObjectHypothesisWithPose hyp_with_pose;
+            hyp_with_pose.hypothesis.class_id = std::to_string(cls_ids[i]);
+            hyp_with_pose.hypothesis.score = scores[i];
+            detection.results.push_back(hyp_with_pose);
+
+            det_msg->detections.push_back(detection);
+        }
+        detection_pub_->publish(*det_msg);
+
+        // ---------- 绘制图像并显示（使用 cv::imshow） ----------
         cv::Mat display_frame = frame.clone();
         for (size_t i = 0; i < boxes.size(); i++) {
             const auto& box = boxes[i];
             float score = scores[i];
             int cls_id = cls_ids[i];
 
-            // 确保坐标在图像内
-            int x1 = std::max(0, box[0]);
-            int y1 = std::max(0, box[1]);
-            int x2 = std::min(display_frame.cols - 1, box[2]);
-            int y2 = std::min(display_frame.rows - 1, box[3]);
+            int x1_int = std::max(0, (int)box[0]);
+            int y1_int = std::max(0, (int)box[1]);
+            int x2_int = std::min(display_frame.cols - 1, (int)box[2]);
+            int y2_int = std::min(display_frame.rows - 1, (int)box[3]);
 
-            // 类别标签
             std::string label = CLASSES[cls_id] + " " + std::to_string(score).substr(0, 4);
-
-            // 绘制矩形
-            cv::rectangle(display_frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
-
-            // 绘制标签背景
+            cv::rectangle(display_frame, cv::Point(x1_int, y1_int), cv::Point(x2_int, y2_int), cv::Scalar(0, 255, 0), 2);
             int baseline;
             cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
             cv::rectangle(display_frame,
-                          cv::Point(x1, y1 - text_size.height - 5),
-                          cv::Point(x1 + text_size.width + 5, y1),
+                          cv::Point(x1_int, y1_int - text_size.height - 5),
+                          cv::Point(x1_int + text_size.width + 5, y1_int),
                           cv::Scalar(0, 255, 0), cv::FILLED);
-            // 绘制标签文字
-            cv::putText(display_frame, label, cv::Point(x1 + 2, y1 - 3),
+            cv::putText(display_frame, label, cv::Point(x1_int + 2, y1_int - 3),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         }
 
-        // 转换为 ROS 图像消息并发布
-        auto img_msg = cv_bridge::CvImage(
-            std_msgs::msg::Header(), "bgr8", display_frame).toImageMsg();
-        img_msg->header.stamp = this->get_clock()->now();
-        img_msg->header.frame_id = "camera";
-        image_pub_->publish(*img_msg);
+        cv::imshow("object", display_frame);
+        cv::waitKey(1);   // 必须调用，否则窗口不更新
 
-        // 释放输出
         rknn_outputs_release(ctx_, n_outputs_, outputs.data());
     }
 
-    // 成员变量
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<vision_msgs::msg::Detection2DArray>::SharedPtr detection_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     cv::VideoCapture cap_;
 
