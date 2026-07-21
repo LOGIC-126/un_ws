@@ -196,8 +196,8 @@ class DetectionWorldNode(Node):
                 continue
 
             cam_pose = Pose()
-            cam_pose.position.x = X_cam
-            cam_pose.position.y = Y_cam
+            cam_pose.position.x = Y_cam
+            cam_pose.position.y = -X_cam
             cam_pose.position.z = z
             cam_poses.poses.append(cam_pose)
 
@@ -205,12 +205,15 @@ class DetectionWorldNode(Node):
             if pos is not None:
                 cos_y = math.cos(yaw_rad)
                 sin_y = math.sin(yaw_rad)
-                world_north = pos[0] + Y_cam * cos_y + X_cam * sin_y   # NED x (北)
-                world_east  = pos[1] + Y_cam * sin_y - X_cam * cos_y   # NED y (东)
+                # world_north = pos[0] + Y_cam * cos_y + X_cam * sin_y   # NED x (北)
+                # world_east  = pos[1] + Y_cam * sin_y - X_cam * cos_y   # NED y (东)
+
+                world_north = pos[0] - cam_pose.position.y * sin_y + cam_pose.position.x * cos_y
+                world_east  = pos[1] + cam_pose.position.y * cos_y + cam_pose.position.x * sin_y
 
                 world_pose = Pose()
-                world_pose.position.x = world_east     # ENU x = 东
-                world_pose.position.y = world_north    # ENU y = 北
+                world_pose.position.x = world_north     # ENU x = 东
+                world_pose.position.y = -world_east    # ENU y = 北
                 world_pose.position.z = 0.0            # ENU z = 上 (地面=0)
                 world_poses.poses.append(world_pose)
 
