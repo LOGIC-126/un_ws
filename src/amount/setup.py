@@ -24,7 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'zhongzhuan = amount.zhongzhuan:main'
+            'zhongzhuan = amount.zhongzhuan:main',
+            'uv2_pub_node = amount.uv2_ros:main',
+            'detection_world_node = amount.detection_world_node:main',
         ],
     },
 )
