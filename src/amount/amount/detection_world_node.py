@@ -4,9 +4,13 @@
 与 uv2_ros.py 的区别：本节点不通过 UDP 接收检测结果，而是直接订阅
 yolo_detector_node.cpp 发布的 vision_msgs/Detection2DArray 话题。
 
-发布话题:
-  /detection/camera_coordinates  — 相机坐标系 (X左正, Y前正, Z=PLANE_DISTANCE)
-  /detection/world_coordinates   — NED 世界坐标
+发布话题 (ROS 标准坐标系，兼容 RViz):
+  /detection/camera_coordinates  — camera_link 帧 (x右, y前, z下)
+  /detection/world_coordinates   — map 帧 ENU (x东, y北, z上)
+
+坐标系转换:
+  相机原始: X_cam左正, Y_cam前正, Z下 → camera_link: x=-X_cam, y=Y_cam, z=Z
+  NED (x北, y东, z下) → map ENU (x东, y北, z上)
 
 数据流:
   yolo_detector_node --ROS2 /detections--> Detection2DArray
@@ -115,8 +119,8 @@ class DetectionWorldNode(Node):
 
         self.get_logger().info('检测世界坐标节点启动, 订阅 /detections (Detection2DArray)')
         self.get_logger().info(f'激光雷达偏移={LASER_OFFSET}m')
-        self.get_logger().info('发布: /detection/camera_coordinates (相机坐标)')
-        self.get_logger().info('发布: /detection/world_coordinates (世界坐标)')
+        self.get_logger().info('发布: /detection/camera_coordinates (camera_link: x右/y前/z下)')
+        self.get_logger().info('发布: /detection/world_coordinates (map ENU: x东/y北/z上)')
 
     # ==================== PX4 回调 ====================
     def _position_callback(self, msg):
@@ -168,18 +172,18 @@ class DetectionWorldNode(Node):
 
         cam_poses = PoseArray()
         cam_poses.header.stamp = stamp
-        cam_poses.header.frame_id = "camera_optical_frame"
+        cam_poses.header.frame_id = "camera_link"       # 下视相机: x右, y前, z下
 
         world_poses = PoseArray()
         world_poses.header.stamp = stamp
-        world_poses.header.frame_id = "map"
+        world_poses.header.frame_id = "map"             # ENU: x东, y北, z上
 
         for det in detections:
             # 中心像素坐标 (Detection2D 的 bbox center)
             cx = det.bbox.center.position.x
             cy = det.bbox.center.position.y
 
-            # ---- 相机坐标 ----
+            # ---- 相机坐标 (X_cam:左正, Y_cam:前正, Z:下) ----
             try:
                 X_cam, Y_cam = self.measurer.pixel_to_world_with_decoupling(
                     cx, cy,
@@ -192,24 +196,24 @@ class DetectionWorldNode(Node):
                 self.get_logger().error(f'像素→相机坐标失败: {e}')
                 continue
 
-            # 相机坐标系下的 Pose
+            # 相机坐标系 → ROS camera_link (x右, y前, z下)
             cam_pose = Pose()
-            cam_pose.position.x = X_cam
-            cam_pose.position.y = Y_cam
-            cam_pose.position.z = z
+            cam_pose.position.x = -X_cam       # 左正 → 右正 (翻转)
+            cam_pose.position.y =  Y_cam       # 前正 → 前正 (不变)
+            cam_pose.position.z =  z           # 下   → 下   (不变)
             cam_poses.poses.append(cam_pose)
 
-            # ---- 世界坐标 (NED) ----
+            # ---- 世界坐标 NED (x北, y东, z下) → ROS map ENU (x东, y北, z上) ----
             if pos is not None:
                 cos_y = math.cos(yaw_rad)
                 sin_y = math.sin(yaw_rad)
-                world_x = pos[0] + Y_cam * cos_y + X_cam * sin_y
-                world_y = pos[1] + Y_cam * sin_y - X_cam * cos_y
+                world_north = pos[0] + Y_cam * cos_y + X_cam * sin_y   # NED x (北)
+                world_east  = pos[1] + Y_cam * sin_y - X_cam * cos_y   # NED y (东)
 
                 world_pose = Pose()
-                world_pose.position.x = world_x
-                world_pose.position.y = world_y
-                world_pose.position.z = 0.0
+                world_pose.position.x = world_east     # ENU x = 东
+                world_pose.position.y = world_north    # ENU y = 北
+                world_pose.position.z = 0.0            # ENU z = 上 (地面=0)
                 world_poses.poses.append(world_pose)
 
         # 发布
