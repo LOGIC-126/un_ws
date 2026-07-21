@@ -29,7 +29,6 @@ static const int   IMG_WIDTH   = 640;
 static const int   IMG_HEIGHT  = 480;
 static const int   TARGET_FPS  = 30;
 static const int   JPEG_QUALITY = 75;       // 75 画质/带宽平衡，80+ 接近无损
-static const char* CAMERA_FMT  = "MJPG";    // 硬件 MJPEG，别用 YUYV
 
 class ImagePublisher : public rclcpp::Node {
 public:
@@ -107,7 +106,7 @@ private:
         // --- raw (本地) ---
         auto raw_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", *ptr).toImageMsg();
         raw_msg->header.stamp = stamp;
-        raw_pub_->publish(std::move(raw_msg));
+        raw_pub_->publish(*raw_msg);
 
         // --- compressed (图传) ---
         auto comp_msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
