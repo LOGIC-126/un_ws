@@ -2,7 +2,7 @@
 """
 双模式机载电脑控制节点 (已集成速度期望平滑滤波器)
 
-硬编码可选控制模式 (修改 CONTROL_MODE 常量即可切换):
+控制模式 (通过 YAML 参数 control_mode 切换, 默认 velocity_pid):
   "position"     — 模式1: 接收期望位置 → 直接向飞控发送位置 setpoint (PX4 内部位置控制器)
   "velocity_pid" — 模式2: 接收期望位置 → 机载 PID 计算期望速度 → 向飞控发送速度 setpoint
                            接收期望速度 → 直接透传给飞控
@@ -23,29 +23,47 @@ from px4_msgs.msg import (
     VehicleLandDetected
 )
 
-# ===========================================================================
-# 硬编码控制模式选择
-# ===========================================================================
-CONTROL_MODE_POSITION = "position"           # PX4 内部位置控制
-CONTROL_MODE_VELOCITY_PID = "velocity_pid"   # 机载 PID → 速度控制
-# ===========================================================================
-
-
 class Land_Control(Node):
     """双模式机载控制节点: 位置直传 / 速度PID (含一阶低通滤波与加速度限幅)"""
-
-    # =======================================================================
-    # 硬编码模式 — 修改此行切换控制模式
-    # =======================================================================
-    CONTROL_MODE = CONTROL_MODE_VELOCITY_PID
-    # =======================================================================
 
     def __init__(self) -> None:
         super().__init__('offboard_control_takeoff_and_land')
 
+        # 可配置参数: vehicle_status 话题后缀 (v2=真机旧版PX4, v4=SITL 1.18+)
+        self.declare_parameter('vehicle_status_suffix', 'v2')
+
+        # 控制模式: "position" (PX4内部位置控制) / "velocity_pid" (机载PID→速度)
+        self.declare_parameter('control_mode', 'velocity_pid')
+        self.control_mode = self.get_parameter('control_mode').value
+
+        # PID 增益 (可通过 YAML 调节)
+        self.declare_parameter('pid.kp_x', 1.2)
+        self.declare_parameter('pid.ki_x', 0.05)
+        self.declare_parameter('pid.kd_x', 0.45)
+        self.declare_parameter('pid.kp_y', 1.2)
+        self.declare_parameter('pid.ki_y', 0.05)
+        self.declare_parameter('pid.kd_y', 0.45)
+        self.declare_parameter('pid.kp_z', 1.2)
+        self.declare_parameter('pid.ki_z', 0.1)
+        self.declare_parameter('pid.kd_z', 0.15)
+        self.declare_parameter('pid.kp_yaw', 1.0)
+        self.declare_parameter('pid.ki_yaw', 0.03)
+        self.declare_parameter('pid.kd_yaw', 0.05)
+
+        # 速度限制
+        self.declare_parameter('pid.max_horizontal_speed', 4.0)
+        self.declare_parameter('pid.max_vertical_speed', 3.0)
+        self.declare_parameter('pid.max_yaw_rate', 1.0)
+
+        # 平滑滤波器参数
+        self.declare_parameter('filter.lpf_cutoff_freq', 6.0)
+        self.declare_parameter('filter.max_accel_horizontal', 5.0)
+        self.declare_parameter('filter.max_accel_vertical', 4.0)
+        self.declare_parameter('filter.max_accel_yaw', 1.5)
+
         self.get_logger().info(
-            f"Control mode: {self.CONTROL_MODE} "
-            f"({'FC position control' if self.CONTROL_MODE == CONTROL_MODE_POSITION else 'Onboard PID → velocity'})"
+            f"Control mode: {self.control_mode} "
+            f"({'FC position control' if self.control_mode == 'position' else 'Onboard PID → velocity'})"
         )
 
         # Configure QoS profile
@@ -69,7 +87,8 @@ class Land_Control(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v2',
+            VehicleStatus,
+            f'/fmu/out/vehicle_status_{self.get_parameter("vehicle_status_suffix").value}',
             self.vehicle_status_callback, qos_profile)
         self.battery_status_subscriber = self.create_subscription(
             BatteryStatus, '/fmu/out/battery_status_v1',
@@ -102,25 +121,22 @@ class Land_Control(Node):
         self.velocity_timeout = 0.5
         self.was_velocity_active = False
 
-        # 速度极限幅值
-        self.max_horizontal_speed = 4.0   # m/s
-        self.max_vertical_speed = 3.0     # m/s
-        self.max_yaw_rate = 1.0           # rad/s
+        # 速度极限幅值 (从参数读取)
+        self.max_horizontal_speed = self.get_parameter('pid.max_horizontal_speed').value
+        self.max_vertical_speed = self.get_parameter('pid.max_vertical_speed').value
+        self.max_yaw_rate = self.get_parameter('pid.max_yaw_rate').value
 
         self.max_speed = 0.4
         self.timer_period = 0.02          # 50Hz 控制周期
         self.max_step = self.max_speed * self.timer_period
 
         # ===================================================================
-        # 【新增】平滑滤波器与物理限制参数 (解决蓝线剧烈抖动与尖峰)
+        # 【平滑滤波器参数】从 YAML 参数读取
         # ===================================================================
-        # 1. 一阶低通滤波器截止频率 (Hz)，值越小滤波越强，但会带来微小延迟。建议 2.0 - 5.0 Hz
-        self.lpf_cutoff_freq = 6.0 
-        
-        # 2. 最大允许加速度限制 (斜率限制)，防止出现瞬间垂直跳变的尖峰指令
-        self.max_accel_horizontal = 5.0   # m/s^2 
-        self.max_accel_vertical = 4.0     # m/s^2
-        self.max_accel_yaw = 1.5          # rad/s^2
+        self.lpf_cutoff_freq = self.get_parameter('filter.lpf_cutoff_freq').value
+        self.max_accel_horizontal = self.get_parameter('filter.max_accel_horizontal').value
+        self.max_accel_vertical = self.get_parameter('filter.max_accel_vertical').value
+        self.max_accel_yaw = self.get_parameter('filter.max_accel_yaw').value
 
         # 3. 滤波器上一次的输出状态值 (初始化为0)
         self.filtered_vx = 0.0
@@ -129,23 +145,23 @@ class Land_Control(Node):
         self.filtered_yawspeed = 0.0
 
         # ===================================================================
-        # PID 控制器参数 (velocity_pid 模式)
+        # PID 控制器参数 (从 YAML 参数读取, velocity_pid 模式)
         # ===================================================================
-        self.kp_x = 1.2
-        self.ki_x = 0.05
-        self.kd_x = 0.45
+        self.kp_x = self.get_parameter('pid.kp_x').value
+        self.ki_x = self.get_parameter('pid.ki_x').value
+        self.kd_x = self.get_parameter('pid.kd_x').value
 
-        self.kp_y = 1.2
-        self.ki_y = 0.05
-        self.kd_y = 0.45
+        self.kp_y = self.get_parameter('pid.kp_y').value
+        self.ki_y = self.get_parameter('pid.ki_y').value
+        self.kd_y = self.get_parameter('pid.kd_y').value
 
-        self.kp_z = 1.2
-        self.ki_z = 0.1
-        self.kd_z = 0.15
+        self.kp_z = self.get_parameter('pid.kp_z').value
+        self.ki_z = self.get_parameter('pid.ki_z').value
+        self.kd_z = self.get_parameter('pid.kd_z').value
 
-        self.kp_yaw = 1.0
-        self.ki_yaw = 0.03
-        self.kd_yaw = 0.05
+        self.kp_yaw = self.get_parameter('pid.kp_yaw').value
+        self.ki_yaw = self.get_parameter('pid.ki_yaw').value
+        self.kd_yaw = self.get_parameter('pid.kd_yaw').value
 
         # PID 内部状态
         self.integral_x = 0.0
@@ -231,7 +247,7 @@ class Land_Control(Node):
 
     def publish_offboard_control_heartbeat_signal(self):
         msg = OffboardControlMode()
-        if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID:
+        if self.control_mode == 'velocity_pid':
             msg.position = False
             msg.velocity = True
             msg.acceleration = False
@@ -403,7 +419,7 @@ class Land_Control(Node):
 
         self.publish_offboard_control_heartbeat_signal()
 
-        mode_label = 'Vel-PID' if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID else 'Pos'
+        mode_label = 'Vel-PID' if self.control_mode == 'velocity_pid' else 'Pos'
         cmd_label = 'DirectVel' if velocity_active else mode_label
         self.get_logger().info(
             f"--- UAV STATUS --- "
@@ -414,9 +430,11 @@ class Land_Control(Node):
 
         if self.offboard_setpoint_counter < 10:
             self.offboard_setpoint_counter += 1
+            # PX4 要求 heartbeat + setpoint 同时持续发送才接受 offboard
+            self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
             return
 
-        if self.CONTROL_MODE == CONTROL_MODE_VELOCITY_PID:
+        if self.control_mode == 'velocity_pid':
             self._timer_velocity_pid_mode(is_landed, is_armed, in_offboard, velocity_active)
         else:
             self._timer_position_mode(is_landed, is_armed, in_offboard, velocity_active)
@@ -435,6 +453,8 @@ class Land_Control(Node):
                 self._reset_pid()
                 self.engage_offboard_mode()
                 self.arm()
+            # 必须持续发 setpoint, PX4 才会接受 offboard 切换
+            self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
         elif in_offboard:
             if abs(tar_z) < 0.05:
@@ -543,7 +563,7 @@ class Land_Control(Node):
 
 
 def main(args=None) -> None:
-    print(f'Starting offboard control node (mode: {Land_Control.CONTROL_MODE})...')
+    print('Starting offboard control node...')
     rclpy.init(args=args)
     offboard_control = Land_Control()
     rclpy.spin(offboard_control)

@@ -57,6 +57,12 @@ class CompetitionMissionNode(Node):
     def __init__(self):
         super().__init__('competition_mission_node')
 
+        # 可配置参数: vehicle_status 话题后缀 (v2=真机旧版PX4, v4=SITL 1.18+)
+        self.declare_parameter('vehicle_status_suffix', 'v4')
+        # 航点插值: 每周期目标点向航点移动步长 (m)
+        self.declare_parameter('interp_step', 0.05)
+        self.declare_parameter('interp_enabled', True)
+
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -73,7 +79,8 @@ class CompetitionMissionNode(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_sub = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v2',
+            VehicleStatus,
+            f'/fmu/out/vehicle_status_{self.get_parameter("vehicle_status_suffix").value}',
             self.vehicle_status_callback, qos_profile)
         # 动物检测日志: "AnBm,animal_type,count"
         self.detection_log_sub = self.create_subscription(
@@ -113,6 +120,14 @@ class CompetitionMissionNode(Node):
         self.target_z = 0.0
         self.target_yaw = 0.0
 
+        # 插值: 目标点(buffer) 和 期望航点(waypoint)
+        self._buf_x = 0.0
+        self._buf_y = 0.0
+        self._buf_z = 0.0
+        self._wp_x = 0.0
+        self._wp_y = 0.0
+        self._wp_z = 0.0
+
         # 根据开关一次性发布初始目标位姿
         if self.ENABLE_AUTO_TAKEOFF:
             self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
@@ -131,8 +146,35 @@ class CompetitionMissionNode(Node):
     def vehicle_status_callback(self, msg: VehicleStatus) -> None:
         self.vehicle_status = msg
 
-    # --- 2. 控制发布 ---
-    def publish_target_position(self) -> None:
+    # --- 2. 插值与控制发布 ---
+    def _interp_tick(self) -> None:
+        """每周期将 target (buffer) 向 waypoint 移动 interp_step 米"""
+        step = self.get_parameter('interp_step').value
+        dx = self._wp_x - self._buf_x
+        dy = self._wp_y - self._buf_y
+        dz = self._wp_z - self._buf_z
+        dist = math.hypot(dx, dy, dz)
+        if dist <= step:
+            self._buf_x = self._wp_x
+            self._buf_y = self._wp_y
+            self._buf_z = self._wp_z
+        else:
+            frac = step / dist
+            self._buf_x += dx * frac
+            self._buf_y += dy * frac
+            self._buf_z += dz * frac
+
+    def _sync_target_to_buffer(self) -> None:
+        """将 target 同步到 buffer 并发布"""
+        if (self.target_x == self._buf_x and self.target_y == self._buf_y and
+            self.target_z == self._buf_z):
+            return
+        self.target_x = self._buf_x
+        self.target_y = self._buf_y
+        self.target_z = self._buf_z
+        self._publish_target()
+
+    def _publish_target(self) -> None:
         msg = Pose()
         msg.position.x = float(self.target_x)
         msg.position.y = float(self.target_y)
@@ -142,16 +184,23 @@ class CompetitionMissionNode(Node):
         self.target_position_pub.publish(msg)
 
     # --- 3. 状态机辅助 ---
+    def set_waypoint(self, x: float, y: float, z: float, yaw: float = 0.0) -> None:
+        """设定期望航点: 若插值关闭则直接跳到航点"""
+        self._wp_x = float(x)
+        self._wp_y = float(y)
+        self._wp_z = float(z)
+        self.target_yaw = float(yaw)
+        if not self.get_parameter('interp_enabled').value:
+            self._buf_x = self._wp_x
+            self._buf_y = self._wp_y
+            self._buf_z = self._wp_z
+        self._sync_target_to_buffer()
+        # 首次调用强制发布 (timer 可能尚未启动)
+        self._publish_target()
+
     def set_target_position(self, x: float, y: float, z: float, yaw: float = 0.0) -> None:
-        fx, fy, fz, fyaw = float(x), float(y), float(z), float(yaw)
-        if (fx == self.target_x and fy == self.target_y and
-            fz == self.target_z and fyaw == self.target_yaw):
-            return
-        self.target_x = fx
-        self.target_y = fy
-        self.target_z = fz
-        self.target_yaw = fyaw
-        self.publish_target_position()
+        """兼容旧接口: 同 set_waypoint"""
+        self.set_waypoint(x, y, z, yaw)
 
     def check_distance(self, x: float, y: float, z: float, threshold: float = 0.15) -> bool:
         pos = self.vehicle_local_position
@@ -447,7 +496,14 @@ class CompetitionMissionNode(Node):
 
     # --- 6. 主循环 ---
     def timer_callback(self) -> None:
-        # A. 安全防护
+        # A. 插值: 始终运行, 确保 target 持续发布 (offboard_control 需要)
+        if self.get_parameter('interp_enabled').value:
+            self._interp_tick()
+            self._sync_target_to_buffer()
+        else:
+            self._publish_target()
+
+        # B. 安全防护
         is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
         is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
@@ -459,7 +515,7 @@ class CompetitionMissionNode(Node):
                     self.wait_start_time = None
                 return
 
-        # B. 运行状态机
+        # C. 运行状态机
         self.run_state_machine()
 
     def run_state_machine(self) -> None:
