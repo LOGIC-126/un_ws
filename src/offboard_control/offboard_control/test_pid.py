@@ -16,7 +16,7 @@ from enum import Enum
 import math
 
 # PX4 反馈 (仅状态读取)
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
 
 # 通用控制消息
 from geometry_msgs.msg import Pose
@@ -46,6 +46,10 @@ class SimpleTestMissionNode(Node):
     def __init__(self):
         super().__init__('simple_test_mission_node')
 
+        # ====== RC 一键启动参数 (通道9→aux1) ======
+        self.declare_parameter('rc_trigger_aux', 'aux1')
+        self.declare_parameter('rc_trigger_threshold', 0.5)
+
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -64,6 +68,10 @@ class SimpleTestMissionNode(Node):
         self.vehicle_status_sub = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v4',
             self.vehicle_status_callback, qos_profile)
+        # RC 一键启动 (aux1, 通道9映射)
+        self.manual_control_sub = self.create_subscription(
+            ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
+            self.manual_control_callback, qos_profile)
 
         # ----- 内部变量 -----
         self.vehicle_status = VehicleStatus()
@@ -72,6 +80,10 @@ class SimpleTestMissionNode(Node):
         self.state = FlightState.INIT
         self.current_mission_index = 0
         self.wait_start_time = None
+
+        # RC 一键启动: 上升沿触发, 触发后不再受开关影响
+        self.rc_triggered = False
+        self._last_rc_trigger_raw = False
 
         # 任务点列表 (x, y, z, mission_type) — 由 generate_mission_points 生成
         self.mission_points = []
@@ -99,6 +111,19 @@ class SimpleTestMissionNode(Node):
 
     def vehicle_status_callback(self, msg: VehicleStatus) -> None:
         self.vehicle_status = msg
+
+    def manual_control_callback(self, msg: ManualControlSetpoint) -> None:
+        """RC 一键启动: 检测 aux1 上升沿 (拨杆低→高) 触发任务"""
+        if not msg.valid:
+            return
+        aux_name = self.get_parameter('rc_trigger_aux').value
+        val = getattr(msg, aux_name, 0.0)
+        raw = (val > self.get_parameter('rc_trigger_threshold').value)
+        if raw and not self._last_rc_trigger_raw:
+            self.rc_triggered = True
+            self.get_logger().info(
+                f"RC 一键启动触发! ({aux_name}={val:.2f})")
+        self._last_rc_trigger_raw = raw
 
     # --- 2. 控制发布 ---
     def publish_target_position(self) -> None:
@@ -198,6 +223,15 @@ class SimpleTestMissionNode(Node):
             if not self.mission_points:
                 self.mission_points = self.generate_mission_points()
 
+            # 一键启动: 等待 RC aux1 上升沿触发
+            if not self.rc_triggered:
+                self.set_target_position(0.0, 0.0, 0.0)
+                self.get_logger().info(
+                    "等待 RC 一键启动 (aux1 拨杆高位)...",
+                    throttle_duration_sec=3.0,
+                )
+                return
+
             if self.ENABLE_AUTO_TAKEOFF:
                 self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
             else:
@@ -209,7 +243,7 @@ class SimpleTestMissionNode(Node):
                 return
 
             self.get_logger().info(
-                f"测试路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
+                f"RC 触发成功！测试路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
             )
             self.state = FlightState.TAKEOFF
 
