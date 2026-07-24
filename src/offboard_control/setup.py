@@ -11,6 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', ['config/pid_params.yaml']),
+        ('share/' + package_name + '/config', ['config/tracking_params.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,6 +31,7 @@ setup(
             'node_mission = offboard_control.mission:main',
             'node_competition_mission = offboard_control.competition_mission:main',
             'node_test_pid = offboard_control.test_pid:main',
+            'node_yolo_tracking = offboard_control.yolo_tracking:main',
         ],
     },
 )

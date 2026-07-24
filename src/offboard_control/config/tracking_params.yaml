@@ -1,0 +1,43 @@
+# ============================================================
+# YOLO 追踪模式 — offboard_control.py 参数配置
+# ============================================================
+# 用法:
+#   ros2 run offboard_control node_offboard_control \
+#     --ros-args --params-file install/offboard_control/share/offboard_control/config/tracking_params.yaml
+#
+# 作用: 在追踪模式下限制 PID 最大速度 (1.0m/s) 和加速度 (2.0m/s²),
+#       避免无人机追踪目标时速度过快。
+# ============================================================
+
+/**:
+  ros__parameters:
+    # --- PX4 版本兼容 (v4=SITL 1.18+) ---
+    vehicle_status_suffix: "v4"
+
+    # --- 控制模式 ---
+    control_mode: "velocity_pid"
+
+    # --- PID 增益 (沿用默认调优值) ---
+    pid.kp_x: 1.8
+    pid.ki_x: 0.05
+    pid.kd_x: 0.8
+    pid.kp_y: 1.8
+    pid.ki_y: 0.05
+    pid.kd_y: 0.8
+    pid.kp_z: 1.2
+    pid.ki_z: 0.1
+    pid.kd_z: 0.15
+    pid.kp_yaw: 1.0
+    pid.ki_yaw: 0.03
+    pid.kd_yaw: 0.05
+
+    # --- 速度限制 (追踪模式 — 保守) ---
+    pid.max_horizontal_speed: 0.3
+    pid.max_vertical_speed: 0.6
+    pid.max_yaw_rate: 0.5
+
+    # --- 平滑滤波器 (追踪模式 — 降低加速度) ---
+    filter.lpf_cutoff_freq: 6.0
+    filter.max_accel_horizontal: 2.0
+    filter.max_accel_vertical: 2.0
+    filter.max_accel_yaw: 1.0
