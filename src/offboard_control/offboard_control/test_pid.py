@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-@作者: RZR (测试任务改编)
-@说明: 飞行任务控制 — 简单状态机测试 (正方形路径)
-       控制链路: 发布 Pose 到 /uav/target_position
-       任务: 正方形 ABCD (边长1m)，A(0,0), B(1,0), C(1,1), D(0,1)
-             路径: A->B->C->D->A  →  A->C->D->B->A  → 降落
+@作者: RZR (PX4 直连版)
+@说明: 正方形路径测试 — 状态机通过 /uav/target_position 发布目标位姿，
+       由 offboard_control 桥接 PX4，不再依赖 MAVROS。
+       任务: A(0,0) B(1,0) C(1,1) D(0,1)
+             路径: A->B->C->D->A -> A->C->D->B->A -> 降落
 """
 
 import rclpy
@@ -16,7 +16,7 @@ from enum import Enum
 import math
 
 # PX4 反馈 (仅状态读取)
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
 
 # 通用控制消息
 from geometry_msgs.msg import Pose
@@ -32,12 +32,10 @@ class FlightState(Enum):
 
 
 class SimpleTestMissionNode(Node):
-    # ====== 硬编码安全开关 ======
-    ENABLE_AUTO_TAKEOFF = True
+    ENABLE_AUTO_TAKEOFF = True   # True: 自动起飞; False: 手动
+    TAKE_HEIGHT = -1.2           # 起飞高度 (NED, m)
 
-    # ====== 任务参数 ======
-    TAKE_HEIGHT = -1.2          # 起飞/任务高度 (NED, m)
-    # 正方形 ABCD 边长 1m，坐标定义 (NED: x→北, y→东)
+    # 正方形顶点 (边长1m)
     A = (0.0, 0.0)
     B = (1.0, 0.0)
     C = (1.0, 1.0)
@@ -46,10 +44,6 @@ class SimpleTestMissionNode(Node):
     def __init__(self):
         super().__init__('simple_test_mission_node')
 
-        # ====== RC 一键启动参数 (通道9→aux1) ======
-        self.declare_parameter('rc_trigger_aux', 'aux1')
-        self.declare_parameter('rc_trigger_threshold', 0.5)
-
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -57,35 +51,26 @@ class SimpleTestMissionNode(Node):
             depth=1
         )
 
-        # ----- 发布器 (解耦) -----
+        # ----- 发布器：解耦方式，发布 Pose 到 /uav/target_position -----
         self.target_position_pub = self.create_publisher(
             Pose, '/uav/target_position', qos_profile)
 
-        # ----- 订阅器 (仅反馈) -----
+        # ----- 订阅 PX4 状态与位置 (直连，不走 MAVROS) -----
+        self.vehicle_status_sub = self.create_subscription(
+            VehicleStatus, '/fmu/out/vehicle_status_v2',
+            self.vehicle_status_callback, qos_profile)
         self.vehicle_local_pos_sub = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, qos_profile)
-        self.vehicle_status_sub = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v4',
-            self.vehicle_status_callback, qos_profile)
-        # RC 一键启动 (aux1, 通道9映射)
-        self.manual_control_sub = self.create_subscription(
-            ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
-            self.manual_control_callback, qos_profile)
 
         # ----- 内部变量 -----
         self.vehicle_status = VehicleStatus()
         self.vehicle_local_position = VehicleLocalPosition()
 
-        self.state = FlightState.INIT
+        self.flight_state = FlightState.INIT
         self.current_mission_index = 0
         self.wait_start_time = None
 
-        # RC 一键启动: 上升沿触发, 触发后不再受开关影响
-        self.rc_triggered = False
-        self._last_rc_trigger_raw = False
-
-        # 任务点列表 (x, y, z, mission_type) — 由 generate_mission_points 生成
         self.mission_points = []
 
         # 目标缓存 (NED)
@@ -94,39 +79,25 @@ class SimpleTestMissionNode(Node):
         self.target_z = 0.0
         self.target_yaw = 0.0
 
-        # 根据开关一次性发布初始目标位姿
+        # 初始发送一次目标位姿
         if self.ENABLE_AUTO_TAKEOFF:
             self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
 
+        # 主循环 (20 Hz)
         self.timer = self.create_timer(0.05, self.timer_callback)
 
         mode_str = "自主起飞" if self.ENABLE_AUTO_TAKEOFF else "手动解锁 (等待外部指令)"
-        self.get_logger().info(
-            f"简单测试任务节点已启动 (控制解耦模式: {mode_str})."
-        )
+        self.get_logger().info(f"PX4 直连测试节点已启动 ({mode_str})")
 
-    # --- 1. 订阅回调 ---
-    def vehicle_local_position_callback(self, msg: VehicleLocalPosition) -> None:
-        self.vehicle_local_position = msg
-
-    def vehicle_status_callback(self, msg: VehicleStatus) -> None:
+    # --- PX4 回调 ---
+    def vehicle_status_callback(self, msg: VehicleStatus):
         self.vehicle_status = msg
 
-    def manual_control_callback(self, msg: ManualControlSetpoint) -> None:
-        """RC 一键启动: 检测 aux1 上升沿 (拨杆低→高) 触发任务"""
-        if not msg.valid:
-            return
-        aux_name = self.get_parameter('rc_trigger_aux').value
-        val = getattr(msg, aux_name, 0.0)
-        raw = (val > self.get_parameter('rc_trigger_threshold').value)
-        if raw and not self._last_rc_trigger_raw:
-            self.rc_triggered = True
-            self.get_logger().info(
-                f"RC 一键启动触发! ({aux_name}={val:.2f})")
-        self._last_rc_trigger_raw = raw
+    def vehicle_local_position_callback(self, msg: VehicleLocalPosition):
+        self.vehicle_local_position = msg
 
-    # --- 2. 控制发布 ---
-    def publish_target_position(self) -> None:
+    # --- 控制发布 ---
+    def publish_target_position(self):
         msg = Pose()
         msg.position.x = float(self.target_x)
         msg.position.y = float(self.target_y)
@@ -135,8 +106,7 @@ class SimpleTestMissionNode(Node):
         msg.orientation.z = math.sin(self.target_yaw / 2.0)
         self.target_position_pub.publish(msg)
 
-    # --- 3. 状态机辅助 ---
-    def set_target_position(self, x: float, y: float, z: float, yaw: float = 0.0) -> None:
+    def set_target_position(self, x, y, z, yaw=0.0):
         fx, fy, fz, fyaw = float(x), float(y), float(z), float(yaw)
         if (fx == self.target_x and fy == self.target_y and
             fz == self.target_z and fyaw == self.target_yaw):
@@ -147,150 +117,126 @@ class SimpleTestMissionNode(Node):
         self.target_yaw = fyaw
         self.publish_target_position()
 
-    def check_distance(self, x: float, y: float, z: float, threshold: float = 0.15) -> bool:
+    def check_distance(self, x, y, z, threshold=0.15):
         pos = self.vehicle_local_position
         dist = math.sqrt((pos.x - x)**2 + (pos.y - y)**2 + (pos.z - z)**2)
         return dist < threshold
 
-    # --- 4. 任务点生成 (测试用) ---
-    def generate_mission_points(self) -> list:
-        """
-        按题目要求生成航点序列：
-        第一圈: A -> B -> C -> D -> A
-        第二段: A -> C -> D -> B -> A (最后降落由状态机 LAND 完成)
-        所有航点保持任务高度，类型设为 "pass" 直接通过。
-        """
+    # --- 航点生成 ---
+    def generate_mission_points(self):
         z = self.TAKE_HEIGHT
-        # 第一圈
         p1 = [self.A, self.B, self.C, self.D, self.A]
-        # 第二段 (注意第一个 A 会紧接着上一个 A，飞机短暂悬停后继续)
         p2 = [self.A, self.C, self.D, self.B, self.A]
 
-        points = []
-        for (x, y) in p1:
-            points.append((x, y, z, "pass"))
-        for (x, y) in p2:
-            points.append((x, y, z, "pass"))
+        def interpolate_path(path):
+            """在每两个相邻航点之间插入中点"""
+            result = []
+            for i in range(len(path)):
+                x, y = path[i]
+                result.append((x, y, z, "pass"))
+                # 在当前点和下一个点之间插入中点（最后一个点之后不插入）
+                if i < len(path) - 1:
+                    nx, ny = path[i + 1]
+                    mx, my = (x + nx) / 2.0, (y + ny) / 2.0
+                    result.append((mx, my, z, "pass"))
+            return result
 
-        self.get_logger().info(
-            f"测试路径已生成，共 {len(points)} 个航点 (高度 {z} m)."
-        )
+        points = []
+        points.extend(interpolate_path(p1))
+        points.extend(interpolate_path(p2))
+        self.get_logger().info(f"生成 {len(points)} 个航点")
         return points
 
-    # --- 5. 任务执行 (所有类型均为 pass) ---
     def execute_mission(self, mission_type: str) -> bool:
+        # 本任务只有 "pass"
         if mission_type == "pass":
-            return True
-        # 保留其他类型兼容，但本测试不会用到
-        if mission_type == "scan":
-            return True
-        if mission_type == "back":
             return True
         if mission_type == "wait":
             return self.Wait()
         return True
 
-    def Wait(self, duration: float = 5.0) -> bool:
+    def Wait(self, duration=5.0):
         now = self.get_clock().now()
         if self.wait_start_time is None:
             self.wait_start_time = now
-            self.get_logger().info(f"悬停等待 {duration} 秒...")
             return False
-        elapsed = (now - self.wait_start_time).nanoseconds / 1e9
-        if elapsed < duration:
+        if (now - self.wait_start_time).nanoseconds * 1e-9 < duration:
             return False
         self.wait_start_time = None
         return True
 
-    # --- 6. 主循环 (状态机) ---
-    def timer_callback(self) -> None:
-        # 安全防护
-        is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
-        is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
+    # --- 主状态机 ---
+    def timer_callback(self):
+        # 安全防护：必须已经解锁且处于 Offboard 模式
+        is_armed = (self.vehicle_status.arming_state ==
+                    VehicleStatus.ARMING_STATE_ARMED)
+        is_offboard = (self.vehicle_status.nav_state ==
+                       VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
-        if self.state not in [FlightState.LAND, FlightState.DONE]:
+        if self.flight_state not in [FlightState.LAND, FlightState.DONE]:
             if not is_armed or not is_offboard:
-                if self.state != FlightState.INIT:
-                    self.get_logger().warn("掉出 Offboard / 上锁状态，退回待命.")
-                    self.state = FlightState.INIT
-                    self.wait_start_time = None
+                if self.flight_state != FlightState.INIT:
+                    self.get_logger().warn("掉出 Offboard 或上锁，退回 INIT")
+                    self.flight_state = FlightState.INIT
                 return
 
         self.run_state_machine()
 
-    def run_state_machine(self) -> None:
-        if self.state == FlightState.INIT:
+    def run_state_machine(self):
+        is_armed = (self.vehicle_status.arming_state ==
+                    VehicleStatus.ARMING_STATE_ARMED)
+        is_offboard = (self.vehicle_status.nav_state ==
+                       VehicleStatus.NAVIGATION_STATE_OFFBOARD)
+
+        if self.flight_state == FlightState.INIT:
             if not self.mission_points:
                 self.mission_points = self.generate_mission_points()
-
-            # 一键启动: 等待 RC aux1 上升沿触发
-            if not self.rc_triggered:
-                self.set_target_position(0.0, 0.0, 0.0)
-                self.get_logger().info(
-                    "等待 RC 一键启动 (aux1 拨杆高位)...",
-                    throttle_duration_sec=3.0,
-                )
-                return
-
+            # 始终发送目标位置 (心跳)
             if self.ENABLE_AUTO_TAKEOFF:
                 self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
             else:
                 self.set_target_position(0.0, 0.0, 0.0)
-                self.get_logger().info(
-                    "自主起飞已禁用，保持 z=0 待命。请手动解锁并切 OFFBOARD...",
-                    throttle_duration_sec=3.0,
-                )
-                return
+            # 等解锁+Offboard 后自动进入 TAKEOFF
+            if is_armed and is_offboard:
+                self.get_logger().info("已解锁且处于 Offboard，开始任务")
+                self.flight_state = FlightState.TAKEOFF
 
-            self.get_logger().info(
-                f"RC 触发成功！测试路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
-            )
-            self.state = FlightState.TAKEOFF
-
-        elif self.state == FlightState.TAKEOFF:
+        elif self.flight_state == FlightState.TAKEOFF:
             self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
             if self.check_distance(0.0, 0.0, self.TAKE_HEIGHT):
-                self.get_logger().info("起飞完成，开始航点遍历.")
+                self.get_logger().info("起飞完成")
                 self.current_mission_index = 0
-                self.state = FlightState.GOTOTAR
+                self.flight_state = FlightState.GOTOTAR
 
-        elif self.state == FlightState.GOTOTAR:
+        elif self.flight_state == FlightState.GOTOTAR:
             if self.current_mission_index < len(self.mission_points):
-                point = self.mission_points[self.current_mission_index]
-                target_x, target_y, target_z, _ = point
-                self.set_target_position(target_x, target_y, target_z)
+                tx, ty, tz, _ = self.mission_points[self.current_mission_index]
+                self.set_target_position(tx, ty, tz)
+                if self.check_distance(tx, ty, tz):
+                    self.get_logger().info(f"到达 {self.current_mission_index+1}/{len(self.mission_points)}")
+                    self.flight_state = FlightState.MISSION
 
-                if self.check_distance(target_x, target_y, target_z):
-                    self.get_logger().info(
-                        f"到达航点 {self.current_mission_index + 1}/{len(self.mission_points)}"
-                    )
-                    self.state = FlightState.MISSION
-
-        elif self.state == FlightState.MISSION:
+        elif self.flight_state == FlightState.MISSION:
             if self.current_mission_index < len(self.mission_points):
-                point = self.mission_points[self.current_mission_index]
-                target_x, target_y, target_z, mission_type = point
-                self.set_target_position(target_x, target_y, target_z)
-
-                if self.execute_mission(mission_type):
-                    self.get_logger().info(
-                        f"航点 {self.current_mission_index + 1} [{mission_type}] 完成"
-                    )
+                tx, ty, tz, mtype = self.mission_points[self.current_mission_index]
+                self.set_target_position(tx, ty, tz)
+                if self.execute_mission(mtype):
+                    self.get_logger().info(f"航点 {self.current_mission_index+1} 完成")
                     if self.current_mission_index >= len(self.mission_points) - 1:
-                        self.get_logger().info("全部航点遍历完毕，准备降落.")
-                        self.state = FlightState.LAND
+                        self.get_logger().info("全部完成，开始降落")
+                        self.flight_state = FlightState.LAND
                     else:
                         self.current_mission_index += 1
-                        self.state = FlightState.GOTOTAR
+                        self.flight_state = FlightState.GOTOTAR
 
-        elif self.state == FlightState.LAND:
+        elif self.flight_state == FlightState.LAND:
             self.set_target_position(0.0, 0.0, 0.0)
             if self.vehicle_local_position.z >= -0.15:
-                self.get_logger().info("已着陆，任务结束.")
-                self.state = FlightState.DONE
+                self.get_logger().info("已着陆，任务结束")
+                self.flight_state = FlightState.DONE
 
-        elif self.state == FlightState.DONE:
-            self.get_logger().info("简单测试任务完成，关闭节点.")
+        elif self.flight_state == FlightState.DONE:
+            self.get_logger().info("任务完成，关闭节点")
             rclpy.shutdown()
 
 
@@ -300,7 +246,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("用户强行终止节点.")
+        pass
     finally:
         node.destroy_node()
         if rclpy.ok():
