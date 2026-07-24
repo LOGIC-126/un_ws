@@ -15,7 +15,7 @@ from enum import Enum
 import math
 
 # PX4 反馈 (仅状态读取)
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
 
 # 通用控制消息
 from geometry_msgs.msg import Pose
@@ -58,16 +58,10 @@ class CompetitionMissionNode(Node):
         super().__init__('competition_mission_node')
 
         # 可配置参数: vehicle_status 话题后缀 (v2=真机旧版PX4, v4=SITL 1.18+)
-        self.declare_parameter('vehicle_status_suffix', 'v4')
+        self.declare_parameter('vehicle_status_suffix', 'v2')
         # 航点插值: 每周期目标点向航点移动步长 (m)
         self.declare_parameter('interp_step', 0.05)
         self.declare_parameter('interp_enabled', True)
-
-        # ====== RC 一键启动参数 (通道9→aux1) ======
-        # ManualControlSetpoint 的字段名: aux1~aux6
-        self.declare_parameter('rc_trigger_aux', 'aux1')
-        # 触发起动阈值: 字段值 > threshold 时触发 (范围 [-1, +1], 拨杆上=+1)
-        self.declare_parameter('rc_trigger_threshold', 0.5)
 
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -96,10 +90,6 @@ class CompetitionMissionNode(Node):
         self.animal_detection_sub = self.create_subscription(
             Pose, '/uav/animal_detection',
             self.animal_detection_callback, 10)
-        # RC 一键启动 (aux1, 通道9映射)
-        self.manual_control_sub = self.create_subscription(
-            ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
-            self.manual_control_callback, qos_profile)
 
         # ----- 路径规划器 -----
         self.solver = GridSolver()
@@ -111,10 +101,6 @@ class CompetitionMissionNode(Node):
         self.state = FlightState.INIT
         self.current_mission_index = 0
         self.wait_start_time = None
-
-        # RC 一键启动: 上升沿触发, 触发后不再受开关影响
-        self.rc_triggered = False
-        self._last_rc_trigger_raw = False
 
         # 由 solver 动态生成的任务点列表 [(x, y, z, mission_type), ...]
         self.mission_points = []
@@ -159,20 +145,6 @@ class CompetitionMissionNode(Node):
 
     def vehicle_status_callback(self, msg: VehicleStatus) -> None:
         self.vehicle_status = msg
-
-    def manual_control_callback(self, msg: ManualControlSetpoint) -> None:
-        """RC 一键启动: 检测 aux1 上升沿 (拨杆低→高) 触发任务"""
-        if not msg.valid:
-            return
-        aux_name = self.get_parameter('rc_trigger_aux').value
-        val = getattr(msg, aux_name, 0.0)
-        raw = (val > self.get_parameter('rc_trigger_threshold').value)
-        # 上升沿检测: 上次为低, 本次为高 → 触发
-        if raw and not self._last_rc_trigger_raw:
-            self.rc_triggered = True
-            self.get_logger().info(
-                f"RC 一键启动触发! ({aux_name}={val:.2f})")
-        self._last_rc_trigger_raw = raw
 
     # --- 2. 插值与控制发布 ---
     def _interp_tick(self) -> None:
@@ -551,15 +523,6 @@ class CompetitionMissionNode(Node):
             if not self.mission_points:
                 self.mission_points = self.generate_mission_points()
 
-            # 一键启动: 等待 RC 通道 9 上升沿触发
-            if not self.rc_triggered:
-                self.set_target_position(0.0, 0.0, 0.0)
-                self.get_logger().info(
-                    "等待 RC 一键启动 (aux1 拨杆高位)...",
-                    throttle_duration_sec=3.0,
-                )
-                return
-
             if self.ENABLE_AUTO_TAKEOFF:
                 self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
             else:
@@ -571,7 +534,7 @@ class CompetitionMissionNode(Node):
                 return
 
             self.get_logger().info(
-                f"RC 触发成功！路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
+                f"路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
             )
             self.state = FlightState.TAKEOFF
 

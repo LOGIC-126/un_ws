@@ -6,7 +6,14 @@ yolo_detector_node.cpp 发布的 vision_msgs/Detection2DArray 话题。
 
 发布话题 (ROS 标准坐标系，兼容 RViz):
   /detection/camera_coordinates  — camera_link 帧 (X左正, Y前正, Z下 = 相机到地面距离)
-  /detection/world_coordinates   — map 帧 ENU (x东, y北, z上)
+  /detection/world_coordinates   — map 帧 ENU (x东, y北, class_id在z, score在orientation.w)
+
+Pose 字段编码约定 (world_coordinates):
+  position.x  = 世界东向坐标 (m)
+  position.y  = 世界北向坐标 (m)
+  position.z  = class_id (类别号, float, 解码: int(p.z))
+  orientation.w = score (置信度, 0~1)
+  orientation.x/y/z = 0 (未使用)
 
 坐标系转换:
   世界坐标: NED (x北, y东, z下) → map ENU (x东, y北, z上)
@@ -108,7 +115,7 @@ class DetectionWorldNode(Node):
         self.cam_pub = self.create_publisher(
             PoseArray, '/detection/camera_coordinates', 10
         )
-        # NED 世界坐标, frame_id: map
+        # NED 世界坐标 (position.z=class_id, orientation.w=score), frame_id: map
         self.world_pub = self.create_publisher(
             PoseArray, '/detection/world_coordinates', 10
         )
@@ -119,7 +126,7 @@ class DetectionWorldNode(Node):
         self.get_logger().info('检测世界坐标节点启动, 订阅 /detections (Detection2DArray)')
         self.get_logger().info(f'激光雷达偏移={LASER_OFFSET}m')
         self.get_logger().info('发布: /detection/camera_coordinates (camera_link: X左正/Y前正/Z下)')
-        self.get_logger().info('发布: /detection/world_coordinates (map ENU: x东/y北/z上)')
+        self.get_logger().info('发布: /detection/world_coordinates (map ENU: x东/y北/class_id|z, score|ow)')
 
     # ==================== PX4 回调 ====================
     def _position_callback(self, msg):
@@ -175,12 +182,19 @@ class DetectionWorldNode(Node):
 
         world_poses = PoseArray()
         world_poses.header.stamp = stamp
-        world_poses.header.frame_id = "map"             # ROS ENU: x东, y北, z上
+        world_poses.header.frame_id = "map"             # ROS ENU: x东, y北, class_id在z
 
         for det in detections:
             # 中心像素坐标 (Detection2D 的 bbox center)
             cx = det.bbox.center.position.x
             cy = det.bbox.center.position.y
+
+            # 提取类别信息
+            class_id = ""
+            score = 0.0
+            if det.results:
+                class_id = det.results[0].hypothesis.class_id
+                score = det.results[0].hypothesis.score
 
             # ---- 相机坐标 (保持原始: X_cam左正, Y_cam前正, Z下) ----
             try:
@@ -205,16 +219,17 @@ class DetectionWorldNode(Node):
             if pos is not None:
                 cos_y = math.cos(yaw_rad)
                 sin_y = math.sin(yaw_rad)
-                # world_north = pos[0] + Y_cam * cos_y + X_cam * sin_y   # NED x (北)
-                # world_east  = pos[1] + Y_cam * sin_y - X_cam * cos_y   # NED y (东)
 
                 world_north = pos[0] - cam_pose.position.y * sin_y + cam_pose.position.x * cos_y
                 world_east  = pos[1] + cam_pose.position.y * cos_y + cam_pose.position.x * sin_y
 
+                cls_id = int(class_id) if class_id.isdigit() else -1
+
                 world_pose = Pose()
-                world_pose.position.x = world_north     # ENU x = 东
-                world_pose.position.y = -world_east    # ENU y = 北
-                world_pose.position.z = 0.0            # ENU z = 上 (地面=0)
+                world_pose.position.x = world_north       # ENU x = 东
+                world_pose.position.y = -world_east       # ENU y = 北
+                world_pose.position.z = float(cls_id)     # 类别号
+                world_pose.orientation.w = score          # 置信度
                 world_poses.poses.append(world_pose)
 
         # 发布
