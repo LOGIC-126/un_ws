@@ -32,7 +32,7 @@ static const int REG_MAX = 16;
 static const std::vector<int> STRIDES = {8, 16, 32};
 
 // ---------- 新增：模式配置 ----------
-static const bool USE_CAMERA = false;        // true: 使用硬件摄像头, false: 订阅话题
+static const bool USE_CAMERA = true;        // true: 使用硬件摄像头, false: 订阅话题
 static const std::string IMAGE_TOPIC = "/camera/color/image_raw";   // 话题模式下的订阅话题
 
 // ========== 后处理函数 ==========
