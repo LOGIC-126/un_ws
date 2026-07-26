@@ -125,7 +125,7 @@ def generate_launch_description():
 
         Node(
             package='nav2_planner',
-            executable='nav2_planner',
+            executable='planner_server',
             name='planner_server',
             parameters=[
                 planner_path,
@@ -136,7 +136,7 @@ def generate_launch_description():
 
         Node(
             package='nav2_controller',
-            executable='nav2_controller',
+            executable='controller_server',
             name='controller_server',
             parameters=[
                 dwb_path,
