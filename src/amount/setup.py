@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'uv2_pub_node = amount.uv2_ros:main',
             'detection_world_node = amount.detection_world_node:main',
+            'detection_world_d435_node = amount.detection_world_d435_node:main',
         ],
     },
 )
