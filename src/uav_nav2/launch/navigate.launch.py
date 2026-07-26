@@ -1,28 +1,22 @@
-#!/usr/bin/env python3
-"""
-Nav2 固定高度 2D 避障导航 Launch 文件
-
-启动节点:
-  1. Nav2 lifecycle manager (自动激活)
-  2. Nav2 global costmap (map 帧, Cartographer /map 输入)
-  3. Nav2 local costmap (odom 帧, /scan 输入)
-  4. Nav2 planner server (NavFn)
-  5. Nav2 controller server (DWB 全向模式)
-  6. Nav2 BT navigator (简化行为树)
-  7. nav2_odometry_bridge (TF→/odom)
-  8. nav2_bridge (/cmd_vel→/uav/target_position)
-  9. static TF map→odom (identity)
- 10. rviz2 (可选, 带 Nav2 目标工具)
-
-前置条件: Cartographer 已启动, 提供 /map + map→base_link TF
-"""
+# Nav2 固定高度 2D 避障导航 Launch 文件
+#
+# 启动节点:
+#   1. planner_server (NavFn + 内部 global costmap)
+#   2. controller_server (DWB 全向 + 内部 local costmap)
+#   3. bt_navigator (简化行为树)
+#   4. lifecycle_manager (自动激活)
+#   5. nav2_odometry_bridge (TF→/odom)
+#   6. nav2_bridge (/cmd_vel→/uav/target_position + /goal_pose→action)
+#   7. static TF map→odom (identity)
+#   8. rviz2 (可选)
+#
+# 前置条件: Cartographer 已启动, 提供 /map + map→base_link TF
 
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -33,7 +27,7 @@ def generate_launch_description():
     # ——— Launch 参数 ———
     rviz_arg = DeclareLaunchArgument(
         'rviz', default_value='true',
-        description='Launch Rviz2 with Nav2 config')
+        description='Launch Rviz2')
 
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
@@ -41,16 +35,13 @@ def generate_launch_description():
 
     # ——— 配置文件路径 ———
     nav2_params_path = os.path.join(pkg_dir, 'config', 'nav2_params.yaml')
-    global_costmap_path = os.path.join(pkg_dir, 'config', 'global_costmap_params.yaml')
-    local_costmap_path = os.path.join(pkg_dir, 'config', 'local_costmap_params.yaml')
     planner_path = os.path.join(pkg_dir, 'config', 'planner_server_params.yaml')
     dwb_path = os.path.join(pkg_dir, 'config', 'dwb_controller_params.yaml')
     bt_path = os.path.join(pkg_dir, 'uav_nav2', 'behavior_tree.xml')
+    rviz_path = os.path.join(pkg_dir, 'rviz', 'navigate.rviz')
 
-    # ——— Nav2 生命周期节点列表 ———
+    # ——— lifecycle 节点列表 (planner/controller 内部管理各自的 costmap) ———
     lifecycle_nodes = [
-        'global_costmap',
-        'local_costmap',
         'planner_server',
         'controller_server',
         'bt_navigator',
@@ -64,7 +55,7 @@ def generate_launch_description():
         # 自定义节点
         # ================================================================
 
-        # 1. Odometry 桥接: TF map→base_link → /odom + odom→base_link TF
+        # Odometry 桥接: TF map→base_link → /odom + odom→base_link TF
         Node(
             package='uav_nav2',
             executable='node_nav2_odometry',
@@ -73,7 +64,7 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # 2. Nav2 桥接: /cmd_vel → /uav/target_position (NED, 固定高度)
+        # Nav2 桥接: /cmd_vel → /uav/target_position + /goal_pose → action
         Node(
             package='uav_nav2',
             executable='node_nav2_bridge',
@@ -82,10 +73,7 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # 3. 静态 TF: map → odom (identity)
-        #    Cartographer 提供 map→base_link, Nav2 需要 odom→base_link.
-        #    设 map→odom 为 identity 后, odometry 桥接发布的
-        #    odom→base_link 恰好等于 map→base_link.
+        # 静态 TF: map → odom (identity)
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
@@ -94,33 +82,7 @@ def generate_launch_description():
         ),
 
         # ================================================================
-        # Nav2 Costmap 节点
-        # ================================================================
-
-        Node(
-            package='nav2_costmap_2d',
-            executable='nav2_costmap_2d',
-            name='global_costmap',
-            parameters=[
-                global_costmap_path,
-                {'use_sim_time': LaunchConfiguration('use_sim_time')},
-            ],
-            output='screen',
-        ),
-
-        Node(
-            package='nav2_costmap_2d',
-            executable='nav2_costmap_2d',
-            name='local_costmap',
-            parameters=[
-                local_costmap_path,
-                {'use_sim_time': LaunchConfiguration('use_sim_time')},
-            ],
-            output='screen',
-        ),
-
-        # ================================================================
-        # Nav2 规划器 + 控制器
+        # Nav2 规划器 (内部含 global costmap)
         # ================================================================
 
         Node(
@@ -133,6 +95,10 @@ def generate_launch_description():
             ],
             output='screen',
         ),
+
+        # ================================================================
+        # Nav2 控制器 (内部含 local costmap, DWB 全向模式)
+        # ================================================================
 
         Node(
             package='nav2_controller',
@@ -147,7 +113,7 @@ def generate_launch_description():
         ),
 
         # ================================================================
-        # Nav2 BT Navigator (简化行为树)
+        # Nav2 BT Navigator
         # ================================================================
 
         Node(
@@ -157,16 +123,12 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'default_bt_xml_filename': bt_path,
-                'plugin_lib_names': [
-                    'nav2_compute_path_to_pose_action_bt_node',
-                    'nav2_follow_path_action_bt_node',
-                ],
             }],
             output='screen',
         ),
 
         # ================================================================
-        # Nav2 Lifecycle Manager (自动激活所有 Nav2 节点)
+        # Nav2 Lifecycle Manager
         # ================================================================
 
         Node(
@@ -182,14 +144,14 @@ def generate_launch_description():
         ),
 
         # ================================================================
-        # Rviz2 (可选)
+        # Rviz2
         # ================================================================
 
         Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
-            arguments=['-d', os.path.join(pkg_dir, 'rviz', 'navigate.rviz')],
+            arguments=['-d', rviz_path],
             condition=IfCondition(LaunchConfiguration('rviz')),
             output='screen',
         ),
