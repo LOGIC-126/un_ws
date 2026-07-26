@@ -114,12 +114,7 @@ class Nav2BridgeNode(Node):
 
     def goal_pose_callback(self, msg: PoseStamped) -> None:
         """Rviz2 Nav2 Goal 点击 → 调用 /navigate_to_pose action"""
-        if not self._goal_action_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error("NavigateToPose action server not available!")
-            return
-
         goal_msg = NavigateToPose.Goal()
-        # 将点击的 2D pose 补充固定高度和 map frame
         goal_msg.pose = msg
         if msg.header.frame_id == '':
             goal_msg.pose.header.frame_id = self.map_frame
@@ -133,7 +128,11 @@ class Nav2BridgeNode(Node):
         send_goal_future.add_done_callback(self._goal_response_callback)
 
     def _goal_response_callback(self, future):
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f"NavigateToPose action failed: {e}")
+            return
         if not goal_handle.accepted:
             self.get_logger().warn("NavigateToPose goal rejected!")
             return
