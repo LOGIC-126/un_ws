@@ -1,0 +1,21 @@
+# ============================================================
+# 点击导航 + A* 规划 + VFH+ 避障参数
+# ============================================================
+
+/**:
+  ros__parameters:
+    # --- 导航参数 ---
+    takeoff_height: -0.8           # NED 飞行高度 (m), 负值=向上
+    arrival_threshold: 0.1         # 航点到达判定距离 (m)
+    waypoint_spacing: 0.1          # A* 路径降采样最小间距 (m)
+    update_rate: 20.0              # 控制循环频率 (Hz)
+    inflate_radius: 0.1            # 障碍物膨胀半径 (m)
+    fixed_frame: "map"             # Rviz2 固定帧
+
+    # --- VFH+ 避障参数 ---
+    safety_distance: 0.5           # 最小安全距离 (m)
+    robot_radius: 0.17              # 无人机半径 (m), 用于掩码扩展
+    detour_distance: 0.25           # 绕行距离 (m)
+    goal_weight: 2.0               # 目标方向权重
+    smooth_weight: 1.5             # 平滑转向权重
+    obstacle_threshold: 0.6        # 触发绕行: 前方阻塞扇区比例
