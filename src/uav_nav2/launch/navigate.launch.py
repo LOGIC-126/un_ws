@@ -124,6 +124,7 @@ def generate_launch_description():
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'default_nav_to_pose_bt_xml': bt_path,
                 'default_nav_through_poses_bt_xml': bt_path,
+                'bt_loop_duration': 50,   # BT tick 由 10ms→50ms, 降低 CPU
                 'plugin_lib_names': [
                     'nav2_compute_path_to_pose_action_bt_node',
                     'nav2_follow_path_action_bt_node',

@@ -1,31 +1,31 @@
 # Nav2 Controller Server: DWB 全向控制器 + 内部 local costmap
 controller_server:
   ros__parameters:
-    controller_frequency: 20.0
+    controller_frequency: 10.0   # Orange Pi 性能适配 (20Hz 跑不满)
     controller_plugins: ["FollowPath"]
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: false
-      min_vel_x: -0.3
-      max_vel_x: 2.0
-      min_vel_y: -2.0
-      max_vel_y: 2.0
-      max_vel_theta: 1.0
+      min_vel_x: 0.0
+      max_vel_x: 1.0             # 降低最高速, 先保证避障效果
+      min_vel_y: -0.5
+      max_vel_y: 0.5
+      max_vel_theta: 0.5
       min_speed_xy: 0.0
-      max_speed_xy: 2.0
+      max_speed_xy: 1.0
       min_speed_theta: 0.0
-      acc_lim_x: 2.0
-      acc_lim_y: 2.0
-      acc_lim_theta: 1.0
+      acc_lim_x: 1.0
+      acc_lim_y: 1.0
+      acc_lim_theta: 0.5
       holonomic_robot: true
-      vx_samples: 20
-      vy_samples: 20
-      vtheta_samples: 40
-      sim_time: 1.5
-      linear_granularity: 0.05
-      angular_granularity: 0.025
-      transform_tolerance: 0.2
+      vx_samples: 10             # 减少采样数, 降低 CPU 负载
+      vy_samples: 10
+      vtheta_samples: 20
+      sim_time: 1.2              # 缩短仿真时间
+      linear_granularity: 0.08
+      angular_granularity: 0.04
+      transform_tolerance: 0.3   # 放宽 TF 容差
 
       critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint",
                 "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
