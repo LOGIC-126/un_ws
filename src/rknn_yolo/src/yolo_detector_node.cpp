@@ -1,3 +1,14 @@
+/**
+ * YOLOv8 目标检测节点 (RK3588 NPU via RKNN)
+ *
+ * 参数通过 YAML 文件加载:
+ *   ros2 run rknn_yolo yolo_detector_node \
+ *     --ros-args --params-file install/rknn_yolo/share/rknn_yolo/config/yolo_detector_params.yaml
+ *
+ * 发布话题:
+ *   /detections  — vision_msgs/Detection2DArray
+ */
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -21,38 +32,25 @@
 
 using namespace std::chrono_literals;
 
-// ========== 配置参数 ==========
-static const std::string RKNN_MODEL = "/home/orangepi/rknn_linker/carv8.rknn";
-static const int IMG_SIZE = 640;
-static const float OBJ_THRESH = 0.25f;
-static const float NMS_THRESH = 0.45f;
-static const std::vector<std::string> CLASSES = {"car"};
-static const int NC = CLASSES.size();
-static const int REG_MAX = 16;
-static const std::vector<int> STRIDES = {8, 16, 32};
+// ========== 后处理工具函数 ==========
 
-// ---------- 新增：模式配置 ----------
-static const bool USE_CAMERA = false;        // true: 使用硬件摄像头, false: 订阅话题
-static const std::string IMAGE_TOPIC = "/camera/color/image_raw";   // 话题模式下的订阅话题
-
-// ========== 后处理函数 ==========
-static void dfl_decode(const float* box_raw, int h, int w, float* decoded) {
+static void dfl_decode(const float* box_raw, int h, int w, int reg_max, float* decoded) {
     int spatial = h * w;
     for (int coord = 0; coord < 4; coord++) {
         for (int j = 0; j < spatial; j++) {
             float max_val = -1e9;
-            for (int k = 0; k < REG_MAX; k++) {
-                float v = box_raw[(coord * REG_MAX + k) * spatial + j];
+            for (int k = 0; k < reg_max; k++) {
+                float v = box_raw[(coord * reg_max + k) * spatial + j];
                 if (v > max_val) max_val = v;
             }
             float sum = 0.0f;
-            for (int k = 0; k < REG_MAX; k++) {
-                float v = box_raw[(coord * REG_MAX + k) * spatial + j];
+            for (int k = 0; k < reg_max; k++) {
+                float v = box_raw[(coord * reg_max + k) * spatial + j];
                 sum += std::exp(v - max_val);
             }
             float result = 0.0f;
-            for (int k = 0; k < REG_MAX; k++) {
-                float v = box_raw[(coord * REG_MAX + k) * spatial + j];
+            for (int k = 0; k < reg_max; k++) {
+                float v = box_raw[(coord * reg_max + k) * spatial + j];
                 result += (std::exp(v - max_val) / sum) * static_cast<float>(k);
             }
             decoded[coord * spatial + j] = result;
@@ -60,145 +58,61 @@ static void dfl_decode(const float* box_raw, int h, int w, float* decoded) {
     }
 }
 
-static std::tuple<std::vector<std::vector<float>>, std::vector<float>, std::vector<int>>
-post_process(const std::vector<rknn_output>& outputs,
-             const std::vector<rknn_tensor_attr>& output_attrs,
-             int img_w, int img_h)
-{
-    std::vector<std::vector<float>> all_boxes;
-    std::vector<float> all_scores;
-    std::vector<int> all_cls;
-
-    for (int i = 0; i < 3; i++) {
-        int stride = STRIDES[i];
-
-        const rknn_output& box_out   = outputs[i*3];
-        const rknn_output& cls_out   = outputs[i*3+1];
-        const rknn_output& sum_out   = outputs[i*3+2];
-
-        (void)output_attrs[i*3+1];
-        (void)output_attrs[i*3+2];
-
-        const rknn_tensor_attr& box_attr = output_attrs[i*3];
-        int h = box_attr.dims[2];
-        int w = box_attr.dims[3];
-        int spatial = h * w;
-
-        std::vector<float> decoded(4 * spatial);
-        dfl_decode((const float*)box_out.buf, h, w, decoded.data());
-
-        const float* lt_x = decoded.data();
-        const float* lt_y = decoded.data() + spatial;
-        const float* rb_x = decoded.data() + 2 * spatial;
-        const float* rb_y = decoded.data() + 3 * spatial;
-
-        const float* cls_data = (const float*)cls_out.buf;
-        const float* sum_data = (const float*)sum_out.buf;
-
-        std::vector<float> gx(spatial), gy(spatial);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int idx = y * w + x;
-                gx[idx] = x + 0.5f;
-                gy[idx] = y + 0.5f;
-            }
-        }
-
-        for (int idx = 0; idx < spatial; idx++) {
-            float obj_score = sum_data[idx];
-            if (obj_score <= OBJ_THRESH) continue;
-
-            float cx = ((gx[idx] - lt_x[idx]) + (gx[idx] + rb_x[idx])) / 2.0f * stride;
-            float cy = ((gy[idx] - lt_y[idx]) + (gy[idx] + rb_y[idx])) / 2.0f * stride;
-            float bw = ((gx[idx] + rb_x[idx]) - (gx[idx] - lt_x[idx])) * stride;
-            float bh = ((gy[idx] + rb_y[idx]) - (gy[idx] - lt_y[idx])) * stride;
-
-            float max_cls_score = -1.0f;
-            int best_cls = -1;
-            for (int c = 0; c < NC; c++) {
-                float score = cls_data[c * spatial + idx];
-                if (score > max_cls_score) {
-                    max_cls_score = score;
-                    best_cls = c;
-                }
-            }
-            if (max_cls_score <= OBJ_THRESH) continue;
-
-            all_boxes.push_back({cx, cy, bw, bh});
-            all_scores.push_back(max_cls_score);
-            all_cls.push_back(best_cls);
-        }
-    }
-
-    std::vector<std::vector<float>> final_boxes;
-    std::vector<float> final_scores;
-    std::vector<int> final_cls_ids;
-
-    if (all_boxes.empty()) {
-        return {final_boxes, final_scores, final_cls_ids};
-    }
-
-    size_t num = all_boxes.size();
-    std::vector<float> x1(num), y1(num), x2(num), y2(num), areas(num);
-    for (size_t i = 0; i < num; i++) {
-        float cx = all_boxes[i][0], cy = all_boxes[i][1];
-        float bw = all_boxes[i][2], bh = all_boxes[i][3];
-        x1[i] = cx - bw / 2.0f;
-        y1[i] = cy - bh / 2.0f;
-        x2[i] = cx + bw / 2.0f;
-        y2[i] = cy + bh / 2.0f;
-        areas[i] = (x2[i] - x1[i]) * (y2[i] - y1[i]);
-    }
-
-    std::vector<int> order(num);
-    for (int i = 0; i < (int)num; i++) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return all_scores[a] > all_scores[b];
-    });
-
-    std::vector<bool> suppressed(num, false);
-    for (size_t i = 0; i < num; i++) {
-        int idx_i = order[i];
-        if (suppressed[idx_i]) continue;
-        final_boxes.push_back({x1[idx_i], y1[idx_i], x2[idx_i], y2[idx_i]});
-        final_scores.push_back(all_scores[idx_i]);
-        final_cls_ids.push_back(all_cls[idx_i]);
-        for (size_t j = i + 1; j < num; j++) {
-            int idx_j = order[j];
-            if (suppressed[idx_j]) continue;
-            float xx1 = std::max(x1[idx_i], x1[idx_j]);
-            float yy1 = std::max(y1[idx_i], y1[idx_j]);
-            float xx2 = std::min(x2[idx_i], x2[idx_j]);
-            float yy2 = std::min(y2[idx_i], y2[idx_j]);
-            float w_intersect = std::max(0.0f, xx2 - xx1);
-            float h_intersect = std::max(0.0f, yy2 - yy1);
-            float iou = (w_intersect * h_intersect) / (areas[idx_i] + areas[idx_j] - w_intersect * h_intersect + 1e-6f);
-            if (iou > NMS_THRESH) {
-                suppressed[idx_j] = true;
-            }
-        }
-    }
-
-    float sx = (float)img_w / IMG_SIZE;
-    float sy = (float)img_h / IMG_SIZE;
-    for (auto& box : final_boxes) {
-        box[0] *= sx;
-        box[1] *= sy;
-        box[2] *= sx;
-        box[3] *= sy;
-    }
-
-    return {final_boxes, final_scores, final_cls_ids};
-}
 
 // ========== 节点类 ==========
+
 class YoloDetector : public rclcpp::Node {
 public:
     YoloDetector() : Node("yolo_detector_node") {
+        // ---- 声明参数 ----
+        // 模型
+        this->declare_parameter("rknn_model", "/home/orangepi/rknn_linker/carv8.rknn");
+        this->declare_parameter("img_size", 640);
+        this->declare_parameter("classes", std::vector<std::string>{"car"});
+        this->declare_parameter("reg_max", 16);
+        this->declare_parameter("strides", std::vector<int64_t>{8, 16, 32});
+
+        // 阈值
+        this->declare_parameter("obj_thresh", 0.25);
+        this->declare_parameter("nms_thresh", 0.45);
+
+        // 输入源
+        this->declare_parameter("use_camera", false);
+        this->declare_parameter("image_topic", "/camera/color/image_raw");
+        this->declare_parameter("camera_width", 640);
+        this->declare_parameter("camera_height", 480);
+        this->declare_parameter("camera_fps", 30);
+
+        // 显示
+        this->declare_parameter("show_display", true);
+
+        // ---- 读取参数 ----
+        rknn_model_  = this->get_parameter("rknn_model").as_string();
+        img_size_    = this->get_parameter("img_size").as_int();
+        classes_     = this->get_parameter("classes").as_string_array();
+        nc_          = static_cast<int>(classes_.size());
+        reg_max_     = this->get_parameter("reg_max").as_int();
+        {
+            auto raw = this->get_parameter("strides").as_integer_array();
+            strides_.clear();
+            for (auto v : raw) strides_.push_back(static_cast<int>(v));
+        }
+
+        obj_thresh_  = static_cast<float>(this->get_parameter("obj_thresh").as_double());
+        nms_thresh_  = static_cast<float>(this->get_parameter("nms_thresh").as_double());
+
+        use_camera_  = this->get_parameter("use_camera").as_bool();
+        image_topic_ = this->get_parameter("image_topic").as_string();
+        camera_w_    = this->get_parameter("camera_width").as_int();
+        camera_h_    = this->get_parameter("camera_height").as_int();
+        camera_fps_  = this->get_parameter("camera_fps").as_int();
+        show_display_= this->get_parameter("show_display").as_bool();
+
+        // ---- 发布者 ----
         detection_pub_ = this->create_publisher<vision_msgs::msg::Detection2DArray>("detections", 10);
 
-        // 初始化 RKNN
-        int ret = rknn_init(&ctx_, const_cast<char*>(RKNN_MODEL.c_str()), 0, 0, nullptr);
+        // ---- 初始化 RKNN ----
+        int ret = rknn_init(&ctx_, const_cast<char*>(rknn_model_.c_str()), 0, 0, nullptr);
         if (ret < 0) {
             RCLCPP_ERROR(this->get_logger(), "rknn_init failed! ret=%d", ret);
             rclcpp::shutdown();
@@ -212,10 +126,11 @@ public:
             rclcpp::shutdown();
             return;
         }
-        n_inputs_ = io_num.n_input;
+        n_inputs_  = io_num.n_input;
         n_outputs_ = io_num.n_output;
         if (n_outputs_ != 9) {
-            RCLCPP_WARN(this->get_logger(), "Expected 9 output tensors, got %d. Adjust post-process.", n_outputs_);
+            RCLCPP_WARN(this->get_logger(),
+                "Expected 9 output tensors, got %d. Adjust post-process.", n_outputs_);
         }
 
         input_attrs_.resize(n_inputs_);
@@ -240,10 +155,12 @@ public:
             }
         }
 
-        // ---------- 根据模式初始化输入源 ----------
-        cv::namedWindow("object", cv::WINDOW_NORMAL);
+        // ---- 根据模式初始化输入源 ----
+        if (show_display_) {
+            cv::namedWindow("object", cv::WINDOW_NORMAL);
+        }
 
-        if (USE_CAMERA) {
+        if (use_camera_) {
             // 硬件摄像头模式
             cap_.open(0);
             if (!cap_.isOpened()) {
@@ -251,28 +168,38 @@ public:
                 rclcpp::shutdown();
                 return;
             }
-            cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-            cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cap_.set(cv::CAP_PROP_FRAME_WIDTH,  camera_w_);
+            cap_.set(cv::CAP_PROP_FRAME_HEIGHT, camera_h_);
+            cap_.set(cv::CAP_PROP_FPS, camera_fps_);
 
-            timer_ = this->create_wall_timer(30ms, std::bind(&YoloDetector::camera_callback, this));
-            RCLCPP_INFO(this->get_logger(), "Running in CAMERA mode. Publishing detections and displaying image.");
+            int period_ms = 1000 / camera_fps_;
+            timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(period_ms),
+                std::bind(&YoloDetector::camera_callback, this));
+            RCLCPP_INFO(this->get_logger(),
+                "CAMERA mode: %dx%d @ %d FPS", camera_w_, camera_h_, camera_fps_);
         } else {
             // 话题订阅模式
             image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-                IMAGE_TOPIC, rclcpp::SensorDataQoS(), 
+                image_topic_, rclcpp::SensorDataQoS(),
                 std::bind(&YoloDetector::image_callback, this, std::placeholders::_1));
-            RCLCPP_INFO(this->get_logger(), "Running in TOPIC mode. Subscribing to '%s'.", IMAGE_TOPIC.c_str());
+            RCLCPP_INFO(this->get_logger(), "TOPIC mode: subscribing '%s'", image_topic_.c_str());
         }
+
+        RCLCPP_INFO(this->get_logger(),
+            "Model: %s, img=%d, classes=%d, obj=%.2f, nms=%.2f",
+            rknn_model_.c_str(), img_size_, nc_, obj_thresh_, nms_thresh_);
     }
 
     ~YoloDetector() {
         if (ctx_) rknn_destroy(ctx_);
         if (cap_.isOpened()) cap_.release();
-        cv::destroyAllWindows();
+        if (show_display_) cv::destroyAllWindows();
     }
 
 private:
-    // ---------- 摄像头定时器回调 ----------
+    // ========== 回调 ==========
+
     void camera_callback() {
         cv::Mat frame;
         cap_ >> frame;
@@ -280,7 +207,6 @@ private:
         process_image(frame);
     }
 
-    // ---------- 话题订阅回调 ----------
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
         try {
             cv::Mat frame = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8)->image;
@@ -290,22 +216,23 @@ private:
         }
     }
 
-    // ---------- 核心处理函数 ----------
+    // ========== 核心处理 ==========
+
     void process_image(cv::Mat frame) {
         int img_h = frame.rows, img_w = frame.cols;
 
         cv::Mat rgb;
         cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
         cv::Mat resized;
-        cv::resize(rgb, resized, cv::Size(IMG_SIZE, IMG_SIZE));
+        cv::resize(rgb, resized, cv::Size(img_size_, img_size_));
 
         rknn_input inputs[1];
         memset(inputs, 0, sizeof(inputs));
         inputs[0].index = 0;
-        inputs[0].type = RKNN_TENSOR_UINT8;
-        inputs[0].size = IMG_SIZE * IMG_SIZE * 3;
-        inputs[0].fmt = RKNN_TENSOR_NHWC;
-        inputs[0].buf = resized.data;
+        inputs[0].type  = RKNN_TENSOR_UINT8;
+        inputs[0].size  = img_size_ * img_size_ * 3;
+        inputs[0].fmt   = RKNN_TENSOR_NHWC;
+        inputs[0].buf   = resized.data;
 
         int ret = rknn_inputs_set(ctx_, 1, inputs);
         if (ret < 0) {
@@ -332,9 +259,9 @@ private:
 
         auto [boxes, scores, cls_ids] = post_process(outputs, output_attrs_, img_w, img_h);
 
-        // ---------- 发布 Detection2DArray ----------
+        // ---- 发布 Detection2DArray ----
         auto det_msg = std::make_shared<vision_msgs::msg::Detection2DArray>();
-        det_msg->header.stamp = this->get_clock()->now();
+        det_msg->header.stamp    = this->get_clock()->now();
         det_msg->header.frame_id = "camera";
 
         for (size_t i = 0; i < boxes.size(); ++i) {
@@ -351,55 +278,216 @@ private:
 
             vision_msgs::msg::ObjectHypothesisWithPose hyp_with_pose;
             hyp_with_pose.hypothesis.class_id = std::to_string(cls_ids[i]);
-            hyp_with_pose.hypothesis.score = scores[i];
+            hyp_with_pose.hypothesis.score    = scores[i];
             detection.results.push_back(hyp_with_pose);
 
             det_msg->detections.push_back(detection);
         }
         detection_pub_->publish(*det_msg);
 
-        // ---------- 绘制并显示图像 ----------
-        cv::Mat display_frame = frame.clone();
-        for (size_t i = 0; i < boxes.size(); i++) {
-            const auto& box = boxes[i];
-            float score = scores[i];
-            int cls_id = cls_ids[i];
+        // ---- 显示 ----
+        if (show_display_) {
+            cv::Mat display_frame = frame.clone();
+            for (size_t i = 0; i < boxes.size(); i++) {
+                const auto& box = boxes[i];
+                float score = scores[i];
+                int cls_id  = cls_ids[i];
 
-            int x1_int = std::max(0, (int)box[0]);
-            int y1_int = std::max(0, (int)box[1]);
-            int x2_int = std::min(display_frame.cols - 1, (int)box[2]);
-            int y2_int = std::min(display_frame.rows - 1, (int)box[3]);
+                int x1_int = std::max(0, static_cast<int>(box[0]));
+                int y1_int = std::max(0, static_cast<int>(box[1]));
+                int x2_int = std::min(display_frame.cols - 1, static_cast<int>(box[2]));
+                int y2_int = std::min(display_frame.rows - 1, static_cast<int>(box[3]));
 
-            std::string label = CLASSES[cls_id] + " " + std::to_string(score).substr(0, 4);
-            cv::rectangle(display_frame, cv::Point(x1_int, y1_int), cv::Point(x2_int, y2_int), cv::Scalar(0, 255, 0), 2);
-            int baseline;
-            cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-            cv::rectangle(display_frame,
-                          cv::Point(x1_int, y1_int - text_size.height - 5),
-                          cv::Point(x1_int + text_size.width + 5, y1_int),
-                          cv::Scalar(0, 255, 0), cv::FILLED);
-            cv::putText(display_frame, label, cv::Point(x1_int + 2, y1_int - 3),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+                std::string label = classes_[cls_id] + " "
+                    + std::to_string(score).substr(0, 4);
+                cv::rectangle(display_frame,
+                    cv::Point(x1_int, y1_int), cv::Point(x2_int, y2_int),
+                    cv::Scalar(0, 255, 0), 2);
+                int baseline;
+                cv::Size text_size = cv::getTextSize(
+                    label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                cv::rectangle(display_frame,
+                    cv::Point(x1_int, y1_int - text_size.height - 5),
+                    cv::Point(x1_int + text_size.width + 5, y1_int),
+                    cv::Scalar(0, 255, 0), cv::FILLED);
+                cv::putText(display_frame, label,
+                    cv::Point(x1_int + 2, y1_int - 3),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+            }
+
+            cv::imshow("object", display_frame);
+            cv::waitKey(1);
         }
-
-        cv::imshow("object", display_frame);
-        cv::waitKey(1);
 
         rknn_outputs_release(ctx_, n_outputs_, outputs.data());
     }
 
-    // ---------- 成员变量 ----------
+    // ========== 后处理 (成员函数, 访问配置) ==========
+
+    std::tuple<std::vector<std::vector<float>>, std::vector<float>, std::vector<int>>
+    post_process(const std::vector<rknn_output>& outputs,
+                 const std::vector<rknn_tensor_attr>& output_attrs,
+                 int img_w, int img_h)
+    {
+        std::vector<std::vector<float>> all_boxes;
+        std::vector<float> all_scores;
+        std::vector<int> all_cls;
+
+        for (int i = 0; i < 3; i++) {
+            int stride = strides_[i];
+
+            const rknn_output& box_out = outputs[i*3];
+            const rknn_output& cls_out = outputs[i*3+1];
+            const rknn_output& sum_out = outputs[i*3+2];
+
+            (void)output_attrs[i*3+1];
+            (void)output_attrs[i*3+2];
+
+            const rknn_tensor_attr& box_attr = output_attrs[i*3];
+            int h = box_attr.dims[2];
+            int w = box_attr.dims[3];
+            int spatial = h * w;
+
+            std::vector<float> decoded(4 * spatial);
+            dfl_decode((const float*)box_out.buf, h, w, reg_max_, decoded.data());
+
+            const float* lt_x = decoded.data();
+            const float* lt_y = decoded.data() + spatial;
+            const float* rb_x = decoded.data() + 2 * spatial;
+            const float* rb_y = decoded.data() + 3 * spatial;
+
+            const float* cls_data = (const float*)cls_out.buf;
+            const float* sum_data = (const float*)sum_out.buf;
+
+            std::vector<float> gx(spatial), gy(spatial);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int idx = y * w + x;
+                    gx[idx] = x + 0.5f;
+                    gy[idx] = y + 0.5f;
+                }
+            }
+
+            for (int idx = 0; idx < spatial; idx++) {
+                float obj_score = sum_data[idx];
+                if (obj_score <= obj_thresh_) continue;
+
+                float cx = ((gx[idx] - lt_x[idx]) + (gx[idx] + rb_x[idx])) / 2.0f * stride;
+                float cy = ((gy[idx] - lt_y[idx]) + (gy[idx] + rb_y[idx])) / 2.0f * stride;
+                float bw = ((gx[idx] + rb_x[idx]) - (gx[idx] - lt_x[idx])) * stride;
+                float bh = ((gy[idx] + rb_y[idx]) - (gy[idx] - lt_y[idx])) * stride;
+
+                float max_cls_score = -1.0f;
+                int best_cls = -1;
+                for (int c = 0; c < nc_; c++) {
+                    float score = cls_data[c * spatial + idx];
+                    if (score > max_cls_score) {
+                        max_cls_score = score;
+                        best_cls = c;
+                    }
+                }
+                if (max_cls_score <= obj_thresh_) continue;
+
+                all_boxes.push_back({cx, cy, bw, bh});
+                all_scores.push_back(max_cls_score);
+                all_cls.push_back(best_cls);
+            }
+        }
+
+        std::vector<std::vector<float>> final_boxes;
+        std::vector<float> final_scores;
+        std::vector<int> final_cls_ids;
+
+        if (all_boxes.empty()) {
+            return {final_boxes, final_scores, final_cls_ids};
+        }
+
+        size_t num = all_boxes.size();
+        std::vector<float> x1(num), y1(num), x2(num), y2(num), areas(num);
+        for (size_t i = 0; i < num; i++) {
+            float cx = all_boxes[i][0], cy = all_boxes[i][1];
+            float bw = all_boxes[i][2], bh = all_boxes[i][3];
+            x1[i] = cx - bw / 2.0f;
+            y1[i] = cy - bh / 2.0f;
+            x2[i] = cx + bw / 2.0f;
+            y2[i] = cy + bh / 2.0f;
+            areas[i] = (x2[i] - x1[i]) * (y2[i] - y1[i]);
+        }
+
+        std::vector<int> order(num);
+        for (size_t i = 0; i < num; i++) order[i] = static_cast<int>(i);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return all_scores[a] > all_scores[b];
+        });
+
+        std::vector<bool> suppressed(num, false);
+        for (size_t i = 0; i < num; i++) {
+            int idx_i = order[i];
+            if (suppressed[idx_i]) continue;
+            final_boxes.push_back({x1[idx_i], y1[idx_i], x2[idx_i], y2[idx_i]});
+            final_scores.push_back(all_scores[idx_i]);
+            final_cls_ids.push_back(all_cls[idx_i]);
+            for (size_t j = i + 1; j < num; j++) {
+                int idx_j = order[j];
+                if (suppressed[idx_j]) continue;
+                float xx1 = std::max(x1[idx_i], x1[idx_j]);
+                float yy1 = std::max(y1[idx_i], y1[idx_j]);
+                float xx2 = std::min(x2[idx_i], x2[idx_j]);
+                float yy2 = std::min(y2[idx_i], y2[idx_j]);
+                float w_intersect = std::max(0.0f, xx2 - xx1);
+                float h_intersect = std::max(0.0f, yy2 - yy1);
+                float iou = (w_intersect * h_intersect)
+                    / (areas[idx_i] + areas[idx_j] - w_intersect * h_intersect + 1e-6f);
+                if (iou > nms_thresh_) {
+                    suppressed[idx_j] = true;
+                }
+            }
+        }
+
+        float sx = static_cast<float>(img_w) / img_size_;
+        float sy = static_cast<float>(img_h) / img_size_;
+        for (auto& box : final_boxes) {
+            box[0] *= sx;
+            box[1] *= sy;
+            box[2] *= sx;
+            box[3] *= sy;
+        }
+
+        return {final_boxes, final_scores, final_cls_ids};
+    }
+
+    // ========== 成员变量 ==========
+
+    // 配置参数
+    std::string rknn_model_;
+    int img_size_;
+    std::vector<std::string> classes_;
+    int nc_;
+    int reg_max_;
+    std::vector<int> strides_;
+    float obj_thresh_;
+    float nms_thresh_;
+    bool use_camera_;
+    std::string image_topic_;
+    int camera_w_;
+    int camera_h_;
+    int camera_fps_;
+    bool show_display_;
+
+    // ROS2
     rclcpp::Publisher<vision_msgs::msg::Detection2DArray>::SharedPtr detection_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;  // 新增话题订阅
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     cv::VideoCapture cap_;
 
+    // RKNN
     rknn_context ctx_ = 0;
-    int n_inputs_ = 0;
+    int n_inputs_  = 0;
     int n_outputs_ = 0;
     std::vector<rknn_tensor_attr> input_attrs_;
     std::vector<rknn_tensor_attr> output_attrs_;
 };
+
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);

@@ -1,0 +1,35 @@
+# ============================================================
+# YOLO 检测节点 — rknn_yolo 参数配置
+# ============================================================
+# 用法:
+#   ros2 run rknn_yolo yolo_detector_node \
+#     --ros-args --params-file install/rknn_yolo/share/rknn_yolo/config/yolo_detector_params.yaml
+#
+# 命令行覆盖:
+#   ros2 run rknn_yolo yolo_detector_node \
+#     --ros-args --params-file install/rknn_yolo/share/rknn_yolo/config/yolo_detector_params.yaml \
+#     -p use_camera:=true -p obj_thresh:=0.5
+# ============================================================
+
+/**:
+  ros__parameters:
+    # --- 模型 ---
+    rknn_model: "/home/orangepi/rknn_linker/carv8.rknn"
+    img_size: 640
+    classes: ["car"]
+    reg_max: 16
+    strides: [8, 16, 32]
+
+    # --- 检测阈值 ---
+    obj_thresh: 0.25
+    nms_thresh: 0.45
+
+    # --- 输入源 ---
+    use_camera: false                 # true: 硬件摄像头, false: 订阅话题
+    image_topic: "/camera/color/image_raw"
+    camera_width: 640
+    camera_height: 480
+    camera_fps: 30
+
+    # --- 显示 ---
+    show_display: true                # cv::imshow 窗口
