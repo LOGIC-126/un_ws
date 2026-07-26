@@ -1,0 +1,20 @@
+# Nav2 + Bridge 全局参数
+/**:
+  ros__parameters:
+    # --- 固定高度 (ENU) ---
+    fixed_altitude: 1.0             # meters, ENU 上为正
+
+    # --- 桥接参数 ---
+    bridge_update_rate: 50.0        # Hz, 与 offboard_control 控制周期一致
+    lookahead_gain: 0.5             # seconds, cmd_vel → 位置偏移因子
+    cmd_vel_timeout: 0.3            # seconds, 超时无 cmd_vel 则悬停
+
+    # --- 坐标系帧名 ---
+    map_frame: "map"
+    odom_frame: "odom"
+    base_link_frame: "base_link"
+
+    # --- 安全速度限制 ---
+    max_horizontal_speed: 2.0       # m/s
+    max_vertical_speed: 0.5         # m/s (固定高度模式下应很小)
+    max_yaw_rate: 1.0               # rad/s

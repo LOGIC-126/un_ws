@@ -1,0 +1,44 @@
+# Nav2 DWB 局部控制器 — 全向(holonomic)模式, 适配四旋翼
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    controller_plugins: ["FollowPath"]
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: false
+      min_vel_x: -0.3
+      max_vel_x: 2.0
+      min_vel_y: -2.0              # 全向: 允许横向移动
+      max_vel_y: 2.0
+      max_vel_theta: 1.0
+      min_speed_xy: 0.0
+      max_speed_xy: 2.0
+      min_speed_theta: 0.0
+      acc_lim_x: 2.0
+      acc_lim_y: 2.0
+      acc_lim_theta: 1.0
+      holonomic_robot: true        # 关键: 四旋翼全向运动
+      vx_samples: 20
+      vy_samples: 20               # 横向速度采样
+      vtheta_samples: 40
+      sim_time: 1.5
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+
+      critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint",
+                "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      PathAlign.scale: 32.0
+      GoalAlign.scale: 24.0
+      ObstacleFootprint.scale: 0.5
+      RotateToGoal.scale: 0.0      # 不需要先转向前方, 全向可任意方向飞行
+      Oscillation.scale: 0.1
+
+      # 四旋翼 footprint (~34cm 对角线正方形)
+      footprint: "[[-0.17, -0.17], [-0.17, 0.17], [0.17, 0.17], [0.17, -0.17]]"
+      footprint_padding: 0.02

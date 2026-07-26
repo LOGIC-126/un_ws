@@ -1,0 +1,26 @@
+<!--
+  Nav2 简化行为树 — 适配四旋翼无人机
+  只包含全局规划 + 路径跟随, 无地面机器人恢复行为 (Spin/BackUp/Wait)
+  失败时自动触发全局重规划。
+
+  Nav2 BT 节点参考:
+    https://docs.nav2.org/behavior_trees/
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="root_sequence">
+      <!-- 步骤 1: 全局路径规划 -->
+      <ComputePathToPose
+        goal="{goal}"
+        path="{path}"
+        planner_id="GridBased"
+        error_code_id="{compute_error}"/>
+
+      <!-- 步骤 2: 局部路径跟随 (DWB 全向模式) -->
+      <FollowPath
+        path="{path}"
+        controller_id="FollowPath"
+        error_code_id="{follow_error}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>
