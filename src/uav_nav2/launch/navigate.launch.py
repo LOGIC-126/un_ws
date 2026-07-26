@@ -122,7 +122,8 @@ def generate_launch_description():
             name='bt_navigator',
             parameters=[{
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
-                'bt_xml_filename': bt_path,
+                'default_nav_to_pose_bt_xml': bt_path,
+                'default_nav_through_poses_bt_xml': bt_path,
                 'plugin_lib_names': [
                     'nav2_compute_path_to_pose_action_bt_node',
                     'nav2_follow_path_action_bt_node',
