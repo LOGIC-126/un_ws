@@ -80,7 +80,8 @@ class ClickNavigateNode(Node):
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, qos_profile)
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, qos_profile)
+            LaserScan, '/scan', self.scan_callback,
+            rclpy.qos.qos_profile_sensor_data)
 
         # ── 发布 ──
         self.target_pub = self.create_publisher(Pose, '/uav/target_position', 10)
