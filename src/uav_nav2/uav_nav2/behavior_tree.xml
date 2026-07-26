@@ -13,14 +13,12 @@
       <ComputePathToPose
         goal="{goal}"
         path="{path}"
-        planner_id="GridBased"
-        error_code_id="{compute_error}"/>
+        planner_id="GridBased"/>
 
       <!-- 步骤 2: 局部路径跟随 (DWB 全向模式) -->
       <FollowPath
         path="{path}"
-        controller_id="FollowPath"
-        error_code_id="{follow_error}"/>
+        controller_id="FollowPath"/>
     </Sequence>
   </BehaviorTree>
 </root>

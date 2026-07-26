@@ -26,8 +26,8 @@ def generate_launch_description():
 
     # ——— Launch 参数 ———
     rviz_arg = DeclareLaunchArgument(
-        'rviz', default_value='true',
-        description='Launch Rviz2')
+        'rviz', default_value='false',
+        description='Launch Rviz2 (default false on drone, use PC for Rviz2)')
 
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
