@@ -19,8 +19,10 @@ import threading
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Pose, Twist
+from geometry_msgs.msg import Pose, PoseStamped, Twist
+from nav2_msgs.action import NavigateToPose
 import tf2_ros
 from tf2_ros import TransformException
 from tf_transformations import quaternion_from_euler
@@ -68,7 +70,7 @@ class Nav2BridgeNode(Node):
         self.current_yaw = 0.0
         self.has_pose = False        # 是否已获取过位姿
 
-        # ——— QoS: 兼容 Nav2 默认的 reliable + keep_last ———
+        # ——— QoS ———
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -82,13 +84,19 @@ class Nav2BridgeNode(Node):
         self.cmd_vel_sub = self.create_subscription(
             Twist, '/cmd_vel', self.cmd_vel_callback, qos_profile)
 
+        # ——— Rviz2 点击目标 → Nav2 action ———
+        self._goal_action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self.goal_sub = self.create_subscription(
+            PoseStamped, '/goal_pose', self.goal_pose_callback, qos_profile)
+
         # ——— 定时器 ———
         self.timer_period = 1.0 / self.update_rate
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
         self.get_logger().info(
             f"Nav2 bridge started: /cmd_vel → /uav/target_position "
-            f"(fixed Z={self.fixed_altitude:.1f}m ENU, {self.update_rate:.0f} Hz)"
+            f"(fixed Z={self.fixed_altitude:.1f}m ENU, {self.update_rate:.0f} Hz) | "
+            f"listening /goal_pose → /navigate_to_pose action"
         )
 
     # =================================================================
@@ -103,6 +111,33 @@ class Nav2BridgeNode(Node):
             # 检测是否有非零速度 → 导航活跃
             if abs(msg.linear.x) > 0.001 or abs(msg.linear.y) > 0.001:
                 self.active = True
+
+    def goal_pose_callback(self, msg: PoseStamped) -> None:
+        """Rviz2 Nav2 Goal 点击 → 调用 /navigate_to_pose action"""
+        if not self._goal_action_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error("NavigateToPose action server not available!")
+            return
+
+        goal_msg = NavigateToPose.Goal()
+        # 将点击的 2D pose 补充固定高度和 map frame
+        goal_msg.pose = msg
+        if msg.header.frame_id == '':
+            goal_msg.pose.header.frame_id = self.map_frame
+
+        self.get_logger().info(
+            f"Goal received: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}) "
+            f"→ sending NavigateToPose action"
+        )
+
+        send_goal_future = self._goal_action_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self._goal_response_callback)
+
+    def _goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn("NavigateToPose goal rejected!")
+            return
+        self.get_logger().info("NavigateToPose goal accepted, Nav2 planning...")
 
     # =================================================================
     # 主循环 (50 Hz)
