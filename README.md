@@ -1,4 +1,4 @@
-# EVA0N — 无人机自主系统
+# EVA0N — Embedded Versatile Autonomy Drone 
 
 基于 ROS 2 Humble + PX4 + RK3588 NPU 的无人机目标检测追踪系统。
 
@@ -9,13 +9,13 @@
 | 机载计算机 | Orange Pi 5 Pro (RK3588) |
 | 飞控 | Pixhawk (PX4) |
 | 雷达 | 雷神 LSN10P |
-| 摄像头 | USB 单目 + Intel RealSense D435 |
+| 摄像头 | USB 单目 + Intel RealSense D435(可选) |
 | 通信 | 串口 (DDS 直连) |
 
 ## 架构概览
 
 ```
-雷达 ──→ Cartographer SLAM ──→ ekf2_trans ──→ PX4 EKF2 (视觉里程计)
+雷达 ──→ Cartographer SLAM ──→ ekf2_trans ──→ PX4 EKF2 (里程计)
                                                ↑
 摄像头 ──→ rknn_yolo (NPU) ──→ amount ──→ offboard_control ──→ PX4 (板载控制)
                                   (坐标变换)    (追踪/任务/PID)
@@ -147,7 +147,7 @@ ros2 run amount detection_world_node
 ros2 run offboard_control node_yolo_tracking
 ```
 
-### 4. 2025 年电赛 H 题
+### 4. 2025 年电赛 H 题飞行部分
 
 7×9 网格 TSP 全覆盖路径规划，逐格扫描识别地面动物目标。
 
