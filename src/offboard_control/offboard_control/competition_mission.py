@@ -18,8 +18,7 @@ import math
 from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
 
 # 通用控制消息
-from geometry_msgs.msg import Pose
-from std_msgs.msg import String
+from geometry_msgs.msg import Pose, PoseArray
 
 # 路径规划
 from .build_road import GridSolver
@@ -87,14 +86,10 @@ class CompetitionMissionNode(Node):
         self.manual_control_sub = self.create_subscription(
             ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
             self.manual_control_callback, qos_profile)
-        # 动物检测日志: "AnBm,animal_type,count"
-        self.detection_log_sub = self.create_subscription(
-            String, '/uav/detection_log',
-            self.detection_log_callback, 10)
-        # 动物相对位置 (NED 差值) + 动物类型 ID
-        self.animal_detection_sub = self.create_subscription(
-            Pose, '/uav/animal_detection',
-            self.animal_detection_callback, 10)
+        # 动物检测世界坐标 (detection_world_node 发布)
+        self.world_coords_sub = self.create_subscription(
+            PoseArray, '/detection/world_coordinates',
+            self.world_coordinates_callback, 10)
 
         # ----- 路径规划器 -----
         self.solver = GridSolver()
@@ -116,14 +111,8 @@ class CompetitionMissionNode(Node):
         # 由 solver 动态生成的任务点列表 [(x, y, z, mission_type), ...]
         self.mission_points = []
 
-        # 已检测到动物的方格: {grid_code: [animal_type, ...]}
+        # 已检测到动物的方格: {grid_code: {animal_type: count, ...}}
         self.detected_grids = {}
-
-        # 动物的世界坐标: {(grid_code, animal_type): (world_x, world_y)}
-        self.animal_positions = {}
-
-        # 已追踪标记，防止重复插入: set of (grid_code, animal_type)
-        self.tracked_animals = set()
 
         # 目标缓存 (NED)
         self.target_x = 0.0
@@ -236,35 +225,33 @@ class CompetitionMissionNode(Node):
         dist = math.sqrt((pos.x - x)**2 + (pos.y - y)**2 + (pos.z - z)**2)
         return dist < threshold
 
-    # --- 4. 路径生成与网格工具 ---
-    def detection_log_callback(self, msg: String) -> None:
-        """接收动物检测日志 'AnBm,animal_type,count'"""
-        try:
-            parts = msg.data.split(',')
-            if len(parts) >= 2:
-                grid_code = parts[0]
-                animal_type = parts[1]
+    # --- 4. 检测数据接收与网格工具 ---
+    def world_coordinates_callback(self, msg: PoseArray) -> None:
+        """接收 detection_world_node 发布的动物世界坐标，按方格累计计数
+
+        Pose 编码 (detection_world_node.py):
+          position.x  = world_north (NED 北)
+          position.y  = -world_east (NED 东取负)
+          position.z  = class_id
+          orientation.w = score
+        """
+        for pose in msg.poses:
+            try:
+                # 还原 NED 坐标
+                ned_x = pose.position.x
+                ned_y = -pose.position.y
+                class_id = int(pose.position.z)
+                if class_id < 0 or class_id >= len(self.ANIMAL_TYPES):
+                    continue
+                animal_type = self.ANIMAL_TYPES[class_id]
+
+                grid_code = self._world_to_grid_code(ned_x, ned_y)
                 if grid_code not in self.detected_grids:
-                    self.detected_grids[grid_code] = []
-                if animal_type not in self.detected_grids[grid_code]:
-                    self.detected_grids[grid_code].append(animal_type)
-        except Exception:
-            pass
-
-    def animal_detection_callback(self, msg: Pose) -> None:
-        """接收动物相对位置，换算为世界 NED 坐标并缓存"""
-        try:
-            type_id = int(msg.orientation.w)
-            type_name = self.ANIMAL_TYPES[type_id]
-        except (IndexError, ValueError):
-            return
-
-        # NED 相对 → 世界
-        world_x = self.vehicle_local_position.x + msg.position.x
-        world_y = self.vehicle_local_position.y + msg.position.y
-
-        grid_code = self._world_to_grid_code(world_x, world_y)
-        self.animal_positions[(grid_code, type_name)] = (world_x, world_y)
+                    self.detected_grids[grid_code] = {}
+                self.detected_grids[grid_code][animal_type] = \
+                    self.detected_grids[grid_code].get(animal_type, 0) + 1
+            except Exception:
+                pass
 
     @staticmethod
     def _world_to_grid_code(x: float, y: float) -> str:
@@ -412,59 +399,30 @@ class CompetitionMissionNode(Node):
         return True
 
     def Scan(self) -> bool:
-        self.get_logger().info("执行扫描任务...", throttle_duration_sec=0.5)
-        # if self.current_mission_index >= len(self.mission_points):
-        #     return True
+        """记录下方方格 (50x50cm) 的动物类别及数量，不控制无人机。
 
-        # # 当前航点方格
-        # cp = self.mission_points[self.current_mission_index]
-        # current_grid = self._world_to_grid_code(cp[0], cp[1])
+        每执行一次打印当前累计检测列表。
+        """
+        # 确定无人机当前所在方格
+        pos = self.vehicle_local_position
+        current_grid = self._world_to_grid_code(pos.x, pos.y)
 
-        # # 下一航点方格
-        # next_grid = None
-        # if self.current_mission_index + 1 < len(self.mission_points):
-        #     np_ = self.mission_points[self.current_mission_index + 1]
-        #     next_grid = self._world_to_grid_code(np_[0], np_[1])
-
-        # # 查找有未追踪动物的方格
-        # target_grid = None
-        # for grid in (current_grid, next_grid):
-        #     if grid is None:
-        #         continue
-        #     if grid not in self.detected_grids:
-        #         continue
-        #     for animal_type in self.detected_grids[grid]:
-        #         if (grid, animal_type) not in self.tracked_animals:
-        #             target_grid = grid
-        #             break
-        #     if target_grid is not None:
-        #         break
-
-        # if target_grid is None:
-        #     return True  # 无目标，跳过
-
-        # # 获取该方格中未追踪的动物
-        # untracked = [
-        #     a for a in self.detected_grids.get(target_grid, [])
-        #     if (target_grid, a) not in self.tracked_animals
-        # ]
-
-        # for animal_type in untracked:
-        #     # 优先取 /uav/animal_detection 累积的世界坐标，fallback 到格心
-        #     key = (target_grid, animal_type)
-        #     if key in self.animal_positions:
-        #         animal_x, animal_y = self.animal_positions[key]
-        #     else:
-        #         animal_x, animal_y = self._grid_code_to_center(target_grid)
-
-        #     self.insert_mission_point_after_current(
-        #         animal_x, animal_y, self.TAKE_HEIGHT, "pass"
-        #     )
-        #     self.tracked_animals.add(key)
-        #     self.get_logger().info(
-        #         f"[Scan] {target_grid} {animal_type} → "
-        #         f"追踪坐标 ({animal_x:.2f}, {animal_y:.2f}) (世界 NED)"
-        #     )
+        # 打印累计检测汇总
+        if self.detected_grids:
+            self.get_logger().info(
+                f"[Scan] ====== 累计检测汇总 (当前方格: {current_grid}) ======"
+            )
+            for grid_code in sorted(self.detected_grids.keys()):
+                animals = self.detected_grids[grid_code]
+                items = ", ".join(
+                    f"{a} x{c}" for a, c in sorted(animals.items())
+                )
+                marker = " <-- 当前" if grid_code == current_grid else ""
+                self.get_logger().info(f"[Scan]   {grid_code}: {items}{marker}")
+        else:
+            self.get_logger().info(
+                f"[Scan] 暂无检测数据 (当前方格: {current_grid})"
+            )
 
         return True
 
