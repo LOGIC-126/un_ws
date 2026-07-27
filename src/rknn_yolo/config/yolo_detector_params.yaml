@@ -27,6 +27,7 @@
     # --- 输入源 ---
     use_camera: false                 # true: 硬件摄像头, false: 订阅话题
     image_topic: "/camera/color/image_raw"
+    camera_device: "/dev/v4l/by-id/usb-HJ_USB_2.0_Camera_HJ_USB_2.0_Camera_SN0001-video-index0"
     camera_width: 640
     camera_height: 480
     camera_fps: 30

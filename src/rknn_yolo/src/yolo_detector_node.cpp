@@ -79,6 +79,7 @@ public:
         // 输入源
         this->declare_parameter("use_camera", false);
         this->declare_parameter("image_topic", "/camera/color/image_raw");
+        this->declare_parameter("camera_device", "/dev/video0");
         this->declare_parameter("camera_width", 640);
         this->declare_parameter("camera_height", 480);
         this->declare_parameter("camera_fps", 30);
@@ -101,9 +102,10 @@ public:
         obj_thresh_  = static_cast<float>(this->get_parameter("obj_thresh").as_double());
         nms_thresh_  = static_cast<float>(this->get_parameter("nms_thresh").as_double());
 
-        use_camera_  = this->get_parameter("use_camera").as_bool();
-        image_topic_ = this->get_parameter("image_topic").as_string();
-        camera_w_    = this->get_parameter("camera_width").as_int();
+        use_camera_   = this->get_parameter("use_camera").as_bool();
+        image_topic_  = this->get_parameter("image_topic").as_string();
+        camera_device_= this->get_parameter("camera_device").as_string();
+        camera_w_     = this->get_parameter("camera_width").as_int();
         camera_h_    = this->get_parameter("camera_height").as_int();
         camera_fps_  = this->get_parameter("camera_fps").as_int();
         show_display_= this->get_parameter("show_display").as_bool();
@@ -162,9 +164,9 @@ public:
 
         if (use_camera_) {
             // 硬件摄像头模式
-            cap_.open(0, cv::CAP_V4L2);
+            cap_.open(camera_device_, cv::CAP_V4L2);
             if (!cap_.isOpened()) {
-                RCLCPP_ERROR(this->get_logger(), "Cannot open camera /dev/video0");
+                RCLCPP_ERROR(this->get_logger(), "Cannot open camera %s", camera_device_.c_str());
                 rclcpp::shutdown();
                 return;
             }
@@ -469,6 +471,7 @@ private:
     float nms_thresh_;
     bool use_camera_;
     std::string image_topic_;
+    std::string camera_device_;
     int camera_w_;
     int camera_h_;
     int camera_fps_;

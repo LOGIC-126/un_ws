@@ -24,7 +24,7 @@
 
 using namespace std::chrono_literals;
 
-static const int   CAMERA_ID   = 0;
+static const char* CAMERA_DEVICE = "/dev/v4l/by-id/usb-HJ_USB_2.0_Camera_HJ_USB_2.0_Camera_SN0001-video-index0";
 static const int   IMG_WIDTH   = 640;
 static const int   IMG_HEIGHT  = 480;
 static const int   TARGET_FPS  = 30;
@@ -37,9 +37,9 @@ public:
         comp_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
             "image_raw/compressed", 10);
 
-        cap_.open(CAMERA_ID, cv::CAP_V4L2);
+        cap_.open(CAMERA_DEVICE, cv::CAP_V4L2);
         if (!cap_.isOpened()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open camera %d", CAMERA_ID);
+            RCLCPP_ERROR(this->get_logger(), "Failed to open camera %s", CAMERA_DEVICE);
             rclcpp::shutdown();
             return;
         }
