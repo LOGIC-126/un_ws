@@ -111,8 +111,11 @@ class CompetitionMissionNode(Node):
         # 由 solver 动态生成的任务点列表 [(x, y, z, mission_type), ...]
         self.mission_points = []
 
-        # 已检测到动物的方格: {grid_code: {animal_type: count, ...}}
+        # 已检测到动物的方格: {grid_code: {animal_type: count, ...}} (Scan() 逐帧累加)
         self.detected_grids = {}
+
+        # 最新一帧检测原始数据 (PoseArray), 仅暂存不累加
+        self._latest_detections = None
 
         # 目标缓存 (NED)
         self.target_x = 0.0
@@ -134,7 +137,7 @@ class CompetitionMissionNode(Node):
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-        mode_str = "自主起飞" if self.ENABLE_AUTO_TAKEOFF else "手动解锁 (等待外部指令)"
+        mode_str = "自主起飞" if self.ENABLE_AUTO_TAKEOFF else "等待 RC aux1 上升沿触发"
         self.get_logger().info(
             f"电赛任务节点已启动 (控制解耦模式: {mode_str})."
         )
@@ -227,31 +230,8 @@ class CompetitionMissionNode(Node):
 
     # --- 4. 检测数据接收与网格工具 ---
     def world_coordinates_callback(self, msg: PoseArray) -> None:
-        """接收 detection_world_node 发布的动物世界坐标，按方格累计计数
-
-        Pose 编码 (detection_world_node.py):
-          position.x  = world_north (NED 北)
-          position.y  = -world_east (NED 东取负)
-          position.z  = class_id
-          orientation.w = score
-        """
-        for pose in msg.poses:
-            try:
-                # 还原 NED 坐标
-                ned_x = pose.position.x
-                ned_y = -pose.position.y
-                class_id = int(pose.position.z)
-                if class_id < 0 or class_id >= len(self.ANIMAL_TYPES):
-                    continue
-                animal_type = self.ANIMAL_TYPES[class_id]
-
-                grid_code = self._world_to_grid_code(ned_x, ned_y)
-                if grid_code not in self.detected_grids:
-                    self.detected_grids[grid_code] = {}
-                self.detected_grids[grid_code][animal_type] = \
-                    self.detected_grids[grid_code].get(animal_type, 0) + 1
-            except Exception:
-                pass
+        """仅暂存最新一帧检测结果，不做累加"""
+        self._latest_detections = msg
 
     @staticmethod
     def _world_to_grid_code(x: float, y: float) -> str:
@@ -399,13 +379,38 @@ class CompetitionMissionNode(Node):
         return True
 
     def Scan(self) -> bool:
-        """记录下方方格 (50x50cm) 的动物类别及数量，不控制无人机。
+        """取最新一帧检测，仅统计下方方格 (50x50cm) 内的动物，不控制无人机。
 
-        每执行一次打印当前累计检测列表。
+        每执行一次累加当前方格结果并打印汇总。
         """
-        # 确定无人机当前所在方格
         pos = self.vehicle_local_position
         current_grid = self._world_to_grid_code(pos.x, pos.y)
+
+        # 取最新单帧，按当前方格过滤统计
+        if self._latest_detections is not None:
+            frame_counts = {}  # {animal_type: count} 仅本帧当前方格内
+            for pose in self._latest_detections.poses:
+                try:
+                    ned_x = pose.position.x
+                    ned_y = -pose.position.y
+                    class_id = int(pose.position.z)
+                    if class_id < 0 or class_id >= len(self.ANIMAL_TYPES):
+                        continue
+                    grid_code = self._world_to_grid_code(ned_x, ned_y)
+                    if grid_code != current_grid:
+                        continue  # 不在下方格子，忽略
+                    animal_type = self.ANIMAL_TYPES[class_id]
+                    frame_counts[animal_type] = frame_counts.get(animal_type, 0) + 1
+                except Exception:
+                    pass
+
+            # 累加到 detected_grids
+            if frame_counts:
+                if current_grid not in self.detected_grids:
+                    self.detected_grids[current_grid] = {}
+                for a, c in frame_counts.items():
+                    self.detected_grids[current_grid][a] = \
+                        self.detected_grids[current_grid].get(a, 0) + c
 
         # 打印累计检测汇总
         if self.detected_grids:
