@@ -45,7 +45,7 @@ class YoloTrackingNode(Node):
         self.declare_parameter('takeoff_height', -1.2)
         self.declare_parameter('arrival_threshold', 0.2)
         self.declare_parameter('confirm_frames', 5)
-        self.declare_parameter('fence_radius', 1.5)
+        self.declare_parameter('fence_radius', 0.75)
         self.declare_parameter('lost_timeout', 1.5)
         self.declare_parameter('search_timeout', 10.0)
         self.declare_parameter('rc_trigger_aux', 'aux1')

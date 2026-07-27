@@ -22,17 +22,17 @@
 using namespace std::chrono_literals;
 
 // ========== 配置参数 ==========
-static const std::string RKNN_MODEL = "/home/orangepi/rknn_linker/v8.rknn";
+static const std::string RKNN_MODEL = "/home/orangepi/rknn_linker/carv8.rknn";
 static const int IMG_SIZE = 640;
 static const float OBJ_THRESH = 0.25f;
 static const float NMS_THRESH = 0.45f;
-static const std::vector<std::string> CLASSES = {"elephant", "tiger", "wolf", "monkey", "peacock"};
+static const std::vector<std::string> CLASSES = {"car"};
 static const int NC = CLASSES.size();
 static const int REG_MAX = 16;
 static const std::vector<int> STRIDES = {8, 16, 32};
 
 // ---------- 新增：模式配置 ----------
-static const bool USE_CAMERA = true;        // true: 使用硬件摄像头, false: 订阅话题
+static const bool USE_CAMERA = false;        // true: 使用硬件摄像头, false: 订阅话题
 static const std::string IMAGE_TOPIC = "/camera/color/image_raw";   // 话题模式下的订阅话题
 
 // ========== 后处理函数 ==========
