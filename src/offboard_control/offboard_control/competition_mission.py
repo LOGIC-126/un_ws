@@ -15,7 +15,7 @@ from enum import Enum
 import math
 
 # PX4 反馈 (仅状态读取)
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
 
 # 通用控制消息
 from geometry_msgs.msg import Pose
@@ -36,7 +36,7 @@ class FlightState(Enum):
 
 class CompetitionMissionNode(Node):
     # ====== 硬编码安全开关 ======
-    ENABLE_AUTO_TAKEOFF = True
+    ENABLE_AUTO_TAKEOFF = False  # 仿真模式: True=自动起飞, False=aux1 上升沿触发起飞
 
     # ====== 任务参数 ======
     # 障碍物数据: A/B 网格坐标，每组三个连续障碍格
@@ -62,6 +62,8 @@ class CompetitionMissionNode(Node):
         # 航点插值: 每周期目标点向航点移动步长 (m)
         self.declare_parameter('interp_step', 0.05)
         self.declare_parameter('interp_enabled', True)
+        self.declare_parameter('rc_trigger_aux', 'aux1')
+        self.declare_parameter('rc_trigger_threshold', 0.5)
 
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -82,6 +84,9 @@ class CompetitionMissionNode(Node):
             VehicleStatus,
             f'/fmu/out/vehicle_status_{self.get_parameter("vehicle_status_suffix").value}',
             self.vehicle_status_callback, qos_profile)
+        self.manual_control_sub = self.create_subscription(
+            ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
+            self.manual_control_callback, qos_profile)
         # 动物检测日志: "AnBm,animal_type,count"
         self.detection_log_sub = self.create_subscription(
             String, '/uav/detection_log',
@@ -101,6 +106,12 @@ class CompetitionMissionNode(Node):
         self.state = FlightState.INIT
         self.current_mission_index = 0
         self.wait_start_time = None
+
+        # RC 持续监控 (非一次性锁存)
+        self._last_rc_raw = False
+        self._rc_level = False           # 当前电平
+        self._rc_rising_edge = False     # 粘性上升沿
+        self._rc_falling_edge = False    # 粘性下降沿
 
         # 由 solver 动态生成的任务点列表 [(x, y, z, mission_type), ...]
         self.mission_points = []
@@ -145,6 +156,24 @@ class CompetitionMissionNode(Node):
 
     def vehicle_status_callback(self, msg: VehicleStatus) -> None:
         self.vehicle_status = msg
+
+    def manual_control_callback(self, msg: ManualControlSetpoint) -> None:
+        """持续监控 aux1: 上升沿/下降沿 + 当前电平"""
+        if not msg.valid:
+            return
+        aux_name = self.get_parameter('rc_trigger_aux').value
+        val = getattr(msg, aux_name, 0.0)
+        current_raw = (val > self.get_parameter('rc_trigger_threshold').value)
+
+        if current_raw and not self._last_rc_raw:
+            self._rc_rising_edge = True
+            self.get_logger().info(f"RC 上升沿 ({aux_name}={val:.2f})")
+        if not current_raw and self._last_rc_raw:
+            self._rc_falling_edge = True
+            self.get_logger().info(f"RC 下降沿 ({aux_name}={val:.2f})")
+
+        self._last_rc_raw = current_raw
+        self._rc_level = current_raw
 
     # --- 2. 插值与控制发布 ---
     def _interp_tick(self) -> None:
@@ -518,25 +547,37 @@ class CompetitionMissionNode(Node):
         # C. 运行状态机
         self.run_state_machine()
 
+        # 消费粘性边沿标志 (每帧清除)
+        self._rc_rising_edge = False
+        self._rc_falling_edge = False
+
     def run_state_machine(self) -> None:
         if self.state == FlightState.INIT:
             if not self.mission_points:
                 self.mission_points = self.generate_mission_points()
 
             if self.ENABLE_AUTO_TAKEOFF:
+                # 仿真模式: 直接起飞
                 self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
-            else:
-                self.set_target_position(0.0, 0.0, 0.0)
                 self.get_logger().info(
-                    "自主起飞已禁用，保持 z=0 待命。请手动解锁并切 OFFBOARD...",
-                    throttle_duration_sec=3.0,
+                    f"路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
                 )
-                return
-
-            self.get_logger().info(
-                f"路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
-            )
-            self.state = FlightState.TAKEOFF
+                self.state = FlightState.TAKEOFF
+            else:
+                # 真机模式: 等待 RC aux1 上升沿触发起飞
+                self.set_target_position(0.0, 0.0, 0.0)
+                if self._rc_rising_edge:
+                    self.get_logger().info(
+                        f"RC aux1 上升沿触发! 路径已生成，共 {len(self.mission_points)} 个航点。"
+                        f"状态: INIT -> TAKEOFF"
+                    )
+                    self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
+                    self.state = FlightState.TAKEOFF
+                else:
+                    self.get_logger().info(
+                        "等待 RC aux1 上升沿触发起飞... (请手动解锁并切 OFFBOARD)",
+                        throttle_duration_sec=3.0,
+                    )
 
         elif self.state == FlightState.TAKEOFF:
             self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
