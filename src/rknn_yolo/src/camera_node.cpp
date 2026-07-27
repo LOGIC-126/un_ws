@@ -37,7 +37,7 @@ public:
         comp_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
             "image_raw/compressed", 10);
 
-        cap_.open(CAMERA_ID);
+        cap_.open(CAMERA_ID, cv::CAP_V4L2);
         if (!cap_.isOpened()) {
             RCLCPP_ERROR(this->get_logger(), "Failed to open camera %d", CAMERA_ID);
             rclcpp::shutdown();

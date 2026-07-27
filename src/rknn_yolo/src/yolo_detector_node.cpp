@@ -162,7 +162,7 @@ public:
 
         if (use_camera_) {
             // 硬件摄像头模式
-            cap_.open(0);
+            cap_.open(0, cv::CAP_V4L2);
             if (!cap_.isOpened()) {
                 RCLCPP_ERROR(this->get_logger(), "Cannot open camera /dev/video0");
                 rclcpp::shutdown();
