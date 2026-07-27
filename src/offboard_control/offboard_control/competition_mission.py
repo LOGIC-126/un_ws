@@ -490,16 +490,15 @@ class CompetitionMissionNode(Node):
         else:
             self._publish_target()
 
-        # B. 安全防护
+        # B. 安全防护 (INIT 阶段放行，等待 RC 触发后再检查 armed/offboard)
         is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
         is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
-        if self.state not in [FlightState.LAND, FlightState.DONE]:
+        if self.state != FlightState.INIT:
             if not is_armed or not is_offboard:
-                if self.state != FlightState.INIT:
-                    self.get_logger().warn("掉出 Offboard / 上锁状态，退回待命.")
-                    self.state = FlightState.INIT
-                    self.wait_start_time = None
+                self.get_logger().warn("掉出 Offboard / 上锁状态，退回待命.")
+                self.state = FlightState.INIT
+                self.wait_start_time = None
                 return
 
         # C. 运行状态机
