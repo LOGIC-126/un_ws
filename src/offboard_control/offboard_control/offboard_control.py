@@ -114,7 +114,6 @@ class Land_Control(Node):
         self.target_yaw = 0.0
 
         self.has_target_altitude = False
-        self.ground_z = None  # 起飞瞬间记录的基准 Z (NED)，用于消除 EKF 原点漂移
 
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
@@ -449,12 +448,7 @@ class Land_Control(Node):
         dt = self.timer_period
 
         if is_landed and not is_armed:
-            # 记录地面基准 Z (消除 EKF 原点漂移)
-            if self.ground_z is None:
-                self.ground_z = self.vehicle_local_position.z
-                self.get_logger().info(f"记录地面基准 Z={self.ground_z:.2f}")
-
-            if self.has_target_altitude and abs(tar_z - self.ground_z) > 0.1:
+            if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self._reset_pid()
                 self.engage_offboard_mode()
@@ -463,8 +457,8 @@ class Land_Control(Node):
             self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
         elif in_offboard:
-            if self.ground_z is not None and abs(tar_z - self.ground_z) < 0.05:
-                self.get_logger().warn("Airborne & Target Z≈ground. Triggering Land Mode...")
+            if abs(tar_z) < 0.05:
+                self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:
                 # —— 核心控制分发 ——
@@ -512,7 +506,6 @@ class Land_Control(Node):
             self.get_logger().info("Touched down. Disarming...")
             self._reset_pid()
             self.disarm()
-            self.ground_z = None  # 重置地面基准，为下次起飞准备
 
     def _timer_position_mode(self, is_landed: bool, is_armed: bool,
                              in_offboard: bool, velocity_active: bool):
@@ -547,19 +540,14 @@ class Land_Control(Node):
         self.was_velocity_active = False
 
         if is_landed and not is_armed:
-            # 记录地面基准 Z (消除 EKF 原点漂移)
-            if self.ground_z is None:
-                self.ground_z = self.vehicle_local_position.z
-                self.get_logger().info(f"记录地面基准 Z={self.ground_z:.2f}")
-
-            if self.has_target_altitude and abs(tar_z - self.ground_z) > 0.1:
+            if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self.engage_offboard_mode()
                 self.arm()
 
         elif in_offboard:
-            if self.ground_z is not None and abs(tar_z - self.ground_z) < 0.05:
-                self.get_logger().warn("Airborne & Target Z≈ground. Triggering Land Mode...")
+            if abs(tar_z) < 0.05:
+                self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:
                 curr_x = self.vehicle_local_position.x
@@ -572,7 +560,6 @@ class Land_Control(Node):
         if is_landed and is_armed and not in_offboard:
             self.get_logger().info("Touched down. Disarming...")
             self.disarm()
-            self.ground_z = None  # 重置地面基准，为下次起飞准备
 
 
 def main(args=None) -> None:
