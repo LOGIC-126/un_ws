@@ -101,7 +101,6 @@ class CompetitionMissionNode(Node):
         self.state = FlightState.INIT
         self.current_mission_index = 0
         self.wait_start_time = None
-        self.ground_z = None  # 起飞瞬间记录的基准 Z (NED)，用于消除 EKF 原点漂移
 
         # RC 持续监控 (非一次性锁存)
         self._last_rc_raw = False
@@ -131,6 +130,10 @@ class CompetitionMissionNode(Node):
         self._wp_x = 0.0
         self._wp_y = 0.0
         self._wp_z = 0.0
+
+        # 根据开关一次性发布初始目标位姿
+        if self.ENABLE_AUTO_TAKEOFF:
+            self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
@@ -510,45 +513,37 @@ class CompetitionMissionNode(Node):
         self._rc_rising_edge = False
         self._rc_falling_edge = False
 
-    def _arm_and_takeoff(self) -> None:
-        """记录地面基准 Z，将所有航点偏移至真实 NED 坐标，切换 TAKEOFF"""
-        self.ground_z = self.vehicle_local_position.z
-        # 航点 Z 均为相对值 (TAKE_HEIGHT / 0.0)，偏移到真实 NED
-        self.mission_points = [
-            (x, y, z + self.ground_z, mt) for x, y, z, mt in self.mission_points
-        ]
-        takeoff_z = self.ground_z + self.TAKE_HEIGHT
-        self.set_target_position(0.0, 0.0, takeoff_z)
-        self.get_logger().info(
-            f"记录地面基准 Z={self.ground_z:.2f}，"
-            f"起飞目标 Z={takeoff_z:.2f}，"
-            f"共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
-        )
-        self.state = FlightState.TAKEOFF
-
     def run_state_machine(self) -> None:
         if self.state == FlightState.INIT:
             if not self.mission_points:
                 self.mission_points = self.generate_mission_points()
 
             if self.ENABLE_AUTO_TAKEOFF:
-                # 仿真模式: 记录地面 Z, 直接起飞
-                self._arm_and_takeoff()
+                # 仿真模式: 直接起飞
+                self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
+                self.get_logger().info(
+                    f"路径已生成，共 {len(self.mission_points)} 个航点。状态: INIT -> TAKEOFF"
+                )
+                self.state = FlightState.TAKEOFF
             else:
                 # 真机模式: 等待 RC aux1 上升沿触发起飞
                 self.set_target_position(0.0, 0.0, 0.0)
                 if self._rc_rising_edge:
-                    self._arm_and_takeoff()
+                    self.get_logger().info(
+                        f"RC aux1 上升沿触发! 路径已生成，共 {len(self.mission_points)} 个航点。"
+                        f"状态: INIT -> TAKEOFF"
+                    )
+                    self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
+                    self.state = FlightState.TAKEOFF
                 else:
                     self.get_logger().info(
-                        "等待 RC aux1 上升沿触发起飞...",
+                        "等待 RC aux1 上升沿触发起飞... (请手动解锁并切 OFFBOARD)",
                         throttle_duration_sec=3.0,
                     )
 
         elif self.state == FlightState.TAKEOFF:
-            takeoff_z = self.ground_z + self.TAKE_HEIGHT
-            self.set_target_position(0.0, 0.0, takeoff_z)
-            if self.check_distance(0.0, 0.0, takeoff_z):
+            self.set_target_position(0.0, 0.0, self.TAKE_HEIGHT)
+            if self.check_distance(0.0, 0.0, self.TAKE_HEIGHT):
                 self.get_logger().info("起飞完成，开始航点遍历.")
                 self.current_mission_index = 0
                 self.state = FlightState.GOTOTAR
@@ -583,8 +578,8 @@ class CompetitionMissionNode(Node):
                         self.state = FlightState.GOTOTAR
 
         elif self.state == FlightState.LAND:
-            self.set_target_position(0.0, 0.0, self.ground_z)
-            if self.vehicle_local_position.z >= self.ground_z - 0.15:
+            self.set_target_position(0.0, 0.0, 0.0)
+            if self.vehicle_local_position.z >= -0.15:
                 self.get_logger().info("已着陆，任务结束.")
                 self.state = FlightState.DONE
 
