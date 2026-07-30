@@ -114,6 +114,7 @@ class Land_Control(Node):
         self.target_yaw = 0.0
 
         self.has_target_altitude = False
+        self.arm_time = None  # 记录解锁时间戳，防止 disarm 秒杀（offboard 切换有延迟）
 
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
@@ -448,15 +449,18 @@ class Land_Control(Node):
         dt = self.timer_period
 
         if is_landed and not is_armed:
+            self.arm_time = None  # 未解锁，清除计时
             if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self._reset_pid()
                 self.engage_offboard_mode()
                 self.arm()
+                self.arm_time = self.get_clock().now()  # 记录解锁时刻
             # 必须持续发 setpoint, PX4 才会接受 offboard 切换
             self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
         elif in_offboard:
+            self.arm_time = None  # offboard 已建立，清除计时
             if abs(tar_z) < 0.05:
                 self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
@@ -503,9 +507,14 @@ class Land_Control(Node):
                 self.publish_velocity_setpoint(smooth_vx, smooth_vy, smooth_vz, smooth_yr)
 
         if is_landed and is_armed and not in_offboard:
-            self.get_logger().info("Touched down. Disarming...")
-            self._reset_pid()
-            self.disarm()
+            # 解锁后有 3 秒宽限期等待 offboard 切换，防止 disarm 秒杀
+            if self.arm_time is None:
+                self.arm_time = self.get_clock().now()
+            elif (self.get_clock().now() - self.arm_time).nanoseconds * 1e-9 > 3.0:
+                self.get_logger().info("Armed but offboard timeout. Disarming...")
+                self._reset_pid()
+                self.disarm()
+                self.arm_time = None
 
     def _timer_position_mode(self, is_landed: bool, is_armed: bool,
                              in_offboard: bool, velocity_active: bool):
@@ -540,12 +549,15 @@ class Land_Control(Node):
         self.was_velocity_active = False
 
         if is_landed and not is_armed:
+            self.arm_time = None  # 未解锁，清除计时
             if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self.engage_offboard_mode()
                 self.arm()
+                self.arm_time = self.get_clock().now()  # 记录解锁时刻
 
         elif in_offboard:
+            self.arm_time = None  # offboard 已建立，清除计时
             if abs(tar_z) < 0.05:
                 self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
@@ -558,8 +570,13 @@ class Land_Control(Node):
                 self.publish_position_setpoint(cmd_x, cmd_y, cmd_z, tar_yaw)
 
         if is_landed and is_armed and not in_offboard:
-            self.get_logger().info("Touched down. Disarming...")
-            self.disarm()
+            # 解锁后有 3 秒宽限期等待 offboard 切换，防止 disarm 秒杀
+            if self.arm_time is None:
+                self.arm_time = self.get_clock().now()
+            elif (self.get_clock().now() - self.arm_time).nanoseconds * 1e-9 > 3.0:
+                self.get_logger().info("Armed but offboard timeout. Disarming...")
+                self.disarm()
+                self.arm_time = None
 
 
 def main(args=None) -> None:
