@@ -21,7 +21,7 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 
 可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH (全自动, 无需RC)
+状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND (全自动, 无需RC)
 """
 
 import math
@@ -49,6 +49,7 @@ class FlightState(Enum):
     LOST = 4
     DROP = 5
     RTH = 6    # Return To Home 返航
+    LAND = 7   # 降落
 
 
 class TFTrackingNode(Node):
@@ -623,14 +624,36 @@ class TFTrackingNode(Node):
                 self.set_target_position(lx, ly, self.drop_height)
 
         # ============================
-        # RTH: 返航 — 返回起飞点 (0,0)
+        # RTH: 返航 — 返回起飞点 (0,0), 到达后降落
         # ============================
         elif self.state == FlightState.RTH:
+            # 持续发送抛投完成信号给小车
+            msg = Int32()
+            msg.data = 1
+            self.drop_complete_pub.publish(msg)
+
             self.get_logger().info(
                 '[RTH] 返航中, 返回起飞点 (0,0)',
                 throttle_duration_sec=2.0)
-
             self.set_target_position(0.0, 0.0, self.takeoff_height)
+
+            if self.check_arrived(0.0, 0.0, self.takeoff_height):
+                self.get_logger().info('RTH → LAND (到达起飞点, 开始降落)')
+                self.state = FlightState.LAND
+
+        # ============================
+        # LAND: 降落 — Z=0 触发 offboard_control 的 land()
+        # ============================
+        elif self.state == FlightState.LAND:
+            # 持续发送抛投完成信号给小车
+            msg = Int32()
+            msg.data = 1
+            self.drop_complete_pub.publish(msg)
+
+            self.get_logger().info(
+                '[LAND] 降落中...',
+                throttle_duration_sec=2.0)
+            self.set_target_position(0.0, 0.0, 0.0)
 
 
 def main(args=None):
