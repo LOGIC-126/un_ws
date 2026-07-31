@@ -45,7 +45,7 @@ class Ekf2LinkDDS(Node):
         self.declare_parameter('car.compensation_distance', 0.5)   # 水平距离阈值(m)
         self.declare_parameter('car.compensation_height', 0.3)     # 高度补偿量(m)
         self.declare_parameter('car.offset_x', 0.6)                # odom→map X偏移(前+)
-        self.declare_parameter('car.offset_y', 0.36)               # odom→map Y偏移(左+)
+        self.declare_parameter('car.offset_y', -0.36)              # odom→map Y偏移(左+右-)
         self.use_car_comp = self.get_parameter('use_car_compensation').value
         self.car_comp_dist = self.get_parameter('car.compensation_distance').value
         self.car_comp_height = self.get_parameter('car.compensation_height').value
