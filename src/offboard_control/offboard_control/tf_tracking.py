@@ -81,6 +81,9 @@ class TFTrackingNode(Node):
 
         # —— 追踪参数 ——
         self.declare_parameter('max_distance', 15.0)
+        self.declare_parameter('close_descent', 0.25)   # 靠近小车时逐渐降落高度 NED (m)
+        self.declare_parameter('rth_offset_x', -0.15)   # 返航点X偏移 NED (往后退, m)
+        self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
 
         # —— 视觉融合 ——
         self.declare_parameter('enable_vision_fusion', False)
@@ -96,6 +99,9 @@ class TFTrackingNode(Node):
         self.search_timeout = self.get_parameter('search_timeout').value
         self.drop_distance_threshold = self.get_parameter('drop_distance_threshold').value
         self.drop_dwell_time = self.get_parameter('drop_dwell_time').value
+        self.close_descent = self.get_parameter('close_descent').value
+        self.rth_offset_x = self.get_parameter('rth_offset_x').value
+        self.rth_offset_y = self.get_parameter('rth_offset_y').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
         self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
         self.land_low_height = -0.3  # 降落过渡高度 NED (30cm, 先PID慢降到此再触发land)
@@ -153,7 +159,8 @@ class TFTrackingNode(Node):
             self.world_coords_sub = None
 
         # —— 小车启动触发 (waypoint_tracker 行驶≥0.5m 后发布) ——
-        self._car_triggered = False
+        # _car_mode: 0=未触发, 1=模式1(跟踪抛投), 2=模式2(跟踪起降, 当前仅追踪)
+        self._car_mode = 0
         self.car_trigger_sub = self.create_subscription(
             Int32, '/car/trigger', self._car_trigger_callback, 10)
 
@@ -225,10 +232,15 @@ class TFTrackingNode(Node):
         self.vehicle_status = msg
 
     def _car_trigger_callback(self, msg: Int32) -> None:
-        """接收小车 waypoint_tracker 的启动信号 (行驶≥0.5m 后触发)"""
-        if msg.data == 1 and not self._car_triggered:
-            self._car_triggered = True
-            self.get_logger().info(f'收到小车启动触发信号 → 无人机将自主起飞')
+        """接收小车 waypoint_tracker 的启动信号 (行驶≥0.5m 后触发)
+        msg.data: 1=模式1(跟踪抛投), 2=模式2(跟踪起降-当前仅追踪)
+        """
+        if msg.data in (1, 2) and self._car_mode == 0:
+            self._car_mode = msg.data
+            mode_names = {1: '跟踪抛投', 2: '跟踪起降'}
+            self.get_logger().info(
+                f'收到小车启动触发信号 → 模式{msg.data}({mode_names.get(msg.data, "未知")}), 无人机将自主起飞'
+            )
 
     def world_coordinates_callback(self, msg: PoseArray) -> None:
         self._latest_detections = msg
@@ -492,8 +504,11 @@ class TFTrackingNode(Node):
         if self.state == FlightState.INIT:
             self.set_target_position(0.0, 0.0, 0.0)
 
-            if self._car_triggered:
-                self.get_logger().info("INIT → TAKEOFF (car trigger)")
+            if self._car_mode >= 1:
+                mode_names = {1: '跟踪抛投', 2: '跟踪起降'}
+                self.get_logger().info(
+                    f"INIT → TAKEOFF (car trigger, 模式{self._car_mode}:{mode_names.get(self._car_mode, '')})"
+                )
                 self.set_target_position(0.0, 0.0, self.takeoff_height)
                 self.state = FlightState.TAKEOFF
             else:
@@ -565,23 +580,28 @@ class TFTrackingNode(Node):
                     self.get_logger().info("目标重新出现，继续追踪")
                     self._lost_start_time = None
 
-                self.set_target_position(ned_x, ned_y, self.takeoff_height)
+                # 靠近小车时逐渐降高: 距离≤阈值时线性插值降低 close_descent
+                close_ratio = max(0.0, 1.0 - dist / self.drop_distance_threshold)
+                track_z = self.takeoff_height + self.close_descent * close_ratio
+                self.set_target_position(ned_x, ned_y, track_z)
 
-                # 抛投检测: 接近小车超过 dwell 时间 → DROP
-                if dist < self.drop_distance_threshold:
-                    if self._drop_start_time is None:
-                        self._drop_start_time = self.get_clock().now()
+                # 抛投检测 (仅模式1): 接近小车超过 dwell 时间 → DROP
+                if self._car_mode == 1:
+                    if dist < self.drop_distance_threshold:
+                        if self._drop_start_time is None:
+                            self._drop_start_time = self.get_clock().now()
+                        else:
+                            dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
+                            if dwell >= self.drop_dwell_time:
+                                self.get_logger().info(
+                                    f'TRACK → DROP (距小车 {dist:.2f}m, 停留 {dwell:.1f}s)')
+                                self._drop_start_time = None
+                                self._drop_enter_time = self.get_clock().now()
+                                self.state = FlightState.DROP
+                                return
                     else:
-                        dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
-                        if dwell >= self.drop_dwell_time:
-                            self.get_logger().info(
-                                f'TRACK → DROP (距小车 {dist:.2f}m, 停留 {dwell:.1f}s)')
-                            self._drop_start_time = None
-                            self._drop_enter_time = self.get_clock().now()
-                            self.state = FlightState.DROP
-                            return
-                else:
-                    self._drop_start_time = None
+                        self._drop_start_time = None
+                # 模式2: 持续追踪, 不进入抛投 (后续扩展起降逻辑)
 
             else:
                 now = self.get_clock().now()
@@ -688,7 +708,7 @@ class TFTrackingNode(Node):
                     throttle_duration_sec=1.0)
 
         # ============================
-        # RTH: 返航 — 返回起飞点 (0,0), 到达后降落
+        # RTH: 返航 — 返回偏移起飞点, 到达后降落
         # ============================
         elif self.state == FlightState.RTH:
             # 持续发送抛投完成信号给小车
@@ -696,13 +716,15 @@ class TFTrackingNode(Node):
             msg.data = 1
             self.drop_complete_pub.publish(msg)
 
+            rth_x = self.rth_offset_x
+            rth_y = self.rth_offset_y
             self.get_logger().info(
-                '[RTH] 返航中, 返回起飞点 (0,0)',
+                f'[RTH] 返航中, 返回 ({rth_x:.2f}, {rth_y:.2f})',
                 throttle_duration_sec=2.0)
-            self.set_target_position(0.0, 0.0, self.takeoff_height)
+            self.set_target_position(rth_x, rth_y, self.takeoff_height)
 
-            if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                self.get_logger().info('RTH → LAND (到达起飞点, 开始两段式降落)')
+            if self.check_arrived(rth_x, rth_y, self.takeoff_height):
+                self.get_logger().info(f'RTH → LAND (到达返航点 ({rth_x:.2f}, {rth_y:.2f}), 开始两段式降落)')
                 self._land_stage = 0
                 self.state = FlightState.LAND
 
@@ -715,14 +737,16 @@ class TFTrackingNode(Node):
             msg.data = 1
             self.drop_complete_pub.publish(msg)
 
+            rth_x = self.rth_offset_x
+            rth_y = self.rth_offset_y
             if self._land_stage == 0:
                 # 阶段0: PID 慢降至过渡高度 (默认 -0.3m = 30cm)
                 self.get_logger().info(
                     f'[LAND] 阶段0: PID慢降至 {abs(self.land_low_height):.1f}m...',
                     throttle_duration_sec=2.0)
-                self.set_target_position(0.0, 0.0, self.land_low_height)
+                self.set_target_position(rth_x, rth_y, self.land_low_height)
 
-                if self.check_arrived(0.0, 0.0, self.land_low_height):
+                if self.check_arrived(rth_x, rth_y, self.land_low_height):
                     self.get_logger().info('LAND 阶段0完成 → 阶段1: 触发 PX4 land')
                     self._land_stage = 1
             else:
@@ -730,7 +754,7 @@ class TFTrackingNode(Node):
                 self.get_logger().info(
                     '[LAND] 阶段1: PX4 降落中...',
                     throttle_duration_sec=2.0)
-                self.set_target_position(0.0, 0.0, 0.0)
+                self.set_target_position(rth_x, rth_y, 0.0)
 
                 # 检测落地: NED z 接近 0 → 切 DONE, 停发目标让 offboard_control disarm
                 if self.vehicle_local_position.z >= -0.15:
@@ -745,7 +769,7 @@ class TFTrackingNode(Node):
                 '[DONE] 持续发送 Z=0, 等待 PX4 落地锁桨...',
                 throttle_duration_sec=3.0)
             # 持续发 Z=0: offboard_control tar_z≈0 → land() → 落地 → disarm
-            self.set_target_position(0.0, 0.0, 0.0)
+            self.set_target_position(self.rth_offset_x, self.rth_offset_y, 0.0)
 
 
 def main(args=None):
