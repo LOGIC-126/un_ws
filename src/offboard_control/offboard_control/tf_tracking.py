@@ -431,7 +431,8 @@ class TFTrackingNode(Node):
         is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
         is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
-        if self.state not in (FlightState.INIT, FlightState.DONE):
+        if self.state not in (FlightState.INIT, FlightState.DROP,
+                               FlightState.RTH, FlightState.LAND, FlightState.DONE):
             if not is_armed or not is_offboard:
                 self.get_logger().warn("掉出 Offboard / 上锁状态, 退回 INIT.")
                 self.state = FlightState.INIT
