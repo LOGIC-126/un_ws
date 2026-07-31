@@ -211,15 +211,16 @@ class Ekf2LinkDDS(Node):
                         f"    exit car zone, dist={dist:.2f}m"
                     )
 
-                # LPF平滑补偿量, 防硬切换抽搐 (~0.5s过渡)
+                # 不对称LPF: 进入急速补偿(抢在EKF反应前), 离开缓慢恢复
                 target_comp = self.car_comp_height if in_zone else 0.0
+                alpha = 0.5 if (target_comp > self.filtered_car_comp) else 0.1
                 self.filtered_car_comp = (
-                    0.9 * self.filtered_car_comp + 0.1 * target_comp
+                    (1.0 - alpha) * self.filtered_car_comp + alpha * target_comp
                 )
                 if self.filtered_car_comp > 0.01:
                     comp_z = laser_z - self.filtered_car_comp
                     self.get_logger().info(
-                        f"[Comp] d={dist:.2f}m comp={self.filtered_car_comp:.2f}m → z={comp_z:.3f}",
+                        f"[Comp] d={dist:.2f}m α={alpha:.1f} comp={self.filtered_car_comp:.2f}m → z={comp_z:.3f}",
                         throttle_duration_sec=1.0
                     )
 
