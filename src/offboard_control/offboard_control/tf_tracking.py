@@ -39,6 +39,7 @@ from tf2_msgs.msg import TFMessage
 import tf_transformations
 
 from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
+from std_msgs.msg import Int32
 from geometry_msgs.msg import Pose, PoseArray
 
 
@@ -144,6 +145,11 @@ class TFTrackingNode(Node):
         else:
             self.world_coords_sub = None
 
+        # —— 小车启动触发 (替代 RC 上升沿) ——
+        self._car_triggered = False
+        self.car_trigger_sub = self.create_subscription(
+            Int32, '/car/trigger', self._car_trigger_callback, 10)
+
         # ====== 状态变量 ======
         self.vehicle_status = VehicleStatus()
         self.vehicle_local_position = VehicleLocalPosition()
@@ -216,6 +222,12 @@ class TFTrackingNode(Node):
 
         self._last_rc_raw = current_raw
         self._rc_level = current_raw
+
+    def _car_trigger_callback(self, msg: Int32) -> None:
+        """接收小车 waypoint_tracker 的启动信号 (行驶≥0.5m 后触发)"""
+        if msg.data == 1 and not self._car_triggered:
+            self._car_triggered = True
+            self.get_logger().info(f'收到小车启动触发信号 → 无人机将自主起飞')
 
     def world_coordinates_callback(self, msg: PoseArray) -> None:
         self._latest_detections = msg
@@ -450,18 +462,18 @@ class TFTrackingNode(Node):
 
     def run_state_machine(self) -> None:
         # ============================
-        # INIT: 地面等待 aux1 上升沿
+        # INIT: 地面等待小车 /car/trigger 启动信号
         # ============================
         if self.state == FlightState.INIT:
             self.set_target_position(0.0, 0.0, 0.0)
 
-            if self._rc_rising_edge:
-                self.get_logger().info("INIT → TAKEOFF (aux1 ↑)")
+            if self._car_triggered:
+                self.get_logger().info("INIT → TAKEOFF (car trigger)")
                 self.set_target_position(0.0, 0.0, self.takeoff_height)
                 self.state = FlightState.TAKEOFF
             else:
                 self.get_logger().info(
-                    "等待 RC aux1 上升沿触发...",
+                    "等待小车 /car/trigger 启动信号...",
                     throttle_duration_sec=3.0,
                 )
 
