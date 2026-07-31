@@ -21,7 +21,7 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 
 可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP (全自动, 无需RC)
+状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH (全自动, 无需RC)
 """
 
 import math
@@ -48,6 +48,7 @@ class FlightState(Enum):
     TRACK = 3
     LOST = 4
     DROP = 5
+    RTH = 6    # Return To Home 返航
 
 
 class TFTrackingNode(Node):
@@ -92,6 +93,7 @@ class TFTrackingNode(Node):
         self.drop_distance_threshold = self.get_parameter('drop_distance_threshold').value
         self.drop_dwell_time = self.get_parameter('drop_dwell_time').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
+        self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
 
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
@@ -126,6 +128,8 @@ class TFTrackingNode(Node):
         # ====== 发布器 ======
         self.target_position_pub = self.create_publisher(
             Pose, '/uav/target_position', qos_profile)
+        self.drop_complete_pub = self.create_publisher(
+            Int32, '/car/drop_complete', 10)
 
         # ====== 订阅器 ======
         self.vehicle_local_pos_sub = self.create_subscription(
@@ -172,6 +176,7 @@ class TFTrackingNode(Node):
 
         # 抛投计时
         self._drop_start_time = None
+        self._drop_enter_time = None   # 进入DROP状态的时刻
 
         # 悬停位置
         self._hover_x = 0.0
@@ -519,6 +524,7 @@ class TFTrackingNode(Node):
                             self.get_logger().info(
                                 f'TRACK → DROP (距小车 {dist:.2f}m, 停留 {dwell:.1f}s)')
                             self._drop_start_time = None
+                            self._drop_enter_time = self.get_clock().now()
                             self.state = FlightState.DROP
                             return
                 else:
@@ -583,13 +589,29 @@ class TFTrackingNode(Node):
                     self.state = FlightState.WAIT
 
         # ============================
-        # DROP: 抛投 — 降低至1m高度, 持续追踪小车
+        # DROP: 抛投 — 降低至0.5m高度, 持续追踪小车, 5s后返航
         # ============================
         elif self.state == FlightState.DROP:
+            # 计时
+            if self._drop_enter_time is None:
+                self._drop_enter_time = self.get_clock().now()
+            elapsed = (self.get_clock().now() - self._drop_enter_time).nanoseconds * 1e-9
+
+            # 超时 → 返航
+            if elapsed >= self.rth_delay:
+                self.get_logger().info(f'DROP → RTH (抛投完成 {elapsed:.1f}s)')
+                # 发布抛投完成信号给小车
+                msg = Int32()
+                msg.data = 1
+                self.drop_complete_pub.publish(msg)
+                self._drop_enter_time = None
+                self.state = FlightState.RTH
+                return
+
             # TODO: 实际抛投逻辑 (舵机/电磁铁/释放装置等)
             self.get_logger().info(
-                '[DROP] 抛投任务执行中... (待实现具体抛投动作)',
-                throttle_duration_sec=3.0)
+                f'[DROP] 抛投 {elapsed:.1f}s/{self.rth_delay}s...',
+                throttle_duration_sec=1.0)
 
             target = self._get_target_ned()
             if target is not None:
@@ -599,6 +621,16 @@ class TFTrackingNode(Node):
             elif self._locked_target is not None:
                 lx, ly = self._locked_target
                 self.set_target_position(lx, ly, self.drop_height)
+
+        # ============================
+        # RTH: 返航 — 返回起飞点 (0,0)
+        # ============================
+        elif self.state == FlightState.RTH:
+            self.get_logger().info(
+                '[RTH] 返航中, 返回起飞点 (0,0)',
+                throttle_duration_sec=2.0)
+
+            self.set_target_position(0.0, 0.0, self.takeoff_height)
 
 
 def main(args=None):
