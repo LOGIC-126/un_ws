@@ -72,19 +72,18 @@ class Ekf2LinkDDS(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, self.qos_profile)
 
-        # ---- 激光高度检测器状态 (IMU预测+激光验证, 零baro) ----
+        # ---- 激光高度检测器状态 (双时间常数, 零baro) ----
         self.raw_laser_distance = -1.0
         self.laser_distance_valid = False
-        self.vehicle_local_pos = None       # VehicleLocalPosition 缓存
+        self.vehicle_local_pos = None
 
         self.ref_ground_z = None            # NED 地面参考高度
         self.ground_z_initialized = False
         self.anomaly_active = False
         self.anomaly_frame_count = 0
         self.normal_frame_count = 0
-        self.prev_laser_distance = -1.0
-        self.filtered_laser_innovation = 0.0
-        self.filtered_laser_height = None   # 发布到 vision position[2]
+        self.fast_laser_height = None       # 快滤波 (α=0.15) → 高度输出
+        self.slow_laser_height = None       # 慢滤波 (α=0.005) → 稳态参考
 
         # ---- 定时器 ----
         self.timer = self.create_timer(1.0 / self.frequency, self.timer_callback)
@@ -106,14 +105,19 @@ class Ekf2LinkDDS(Node):
     def vehicle_local_position_callback(self, msg: VehicleLocalPosition) -> None:
         self.vehicle_local_pos = msg
 
-    # ==================== 激光高度处理 (IMU预测+激光验证, 零baro) ====================
+    # ==================== 激光高度处理 (双时间常数异常检测) ====================
 
     def _update_laser_height(self, laser_distance: float, dt: float) -> float:
         """
         处理原始激光距离 → 滤波高度, 含小车异常检测.
 
+        双时间常数原理:
+          fast_h (α=0.15):  追踪高度输出, 响应快
+          slow_h (α=0.005): 稳态参考, 响应极慢
+          小车出现 → fast_h突变, slow_h不变 → |fast - slow| > 阈值 → 异常
+          异常确认 → ref_ground_z瞬间修正 → fast_h立即恢复正确
+
         返回: 滤波后的激光高度 (NED, m).
-        飞控端 EKF2_RNG_CTRL=0 保证 vehicle_local_position 不被激光污染.
         """
         if not self.laser_distance_valid or laser_distance <= 0.0:
             return None
@@ -122,58 +126,51 @@ class Ekf2LinkDDS(Node):
             return None
 
         ekf_z = self.vehicle_local_pos.z
-        vz = self.vehicle_local_pos.vz
 
-        # Step 0: 初始化地面参考 (仅一次)
+        # ---- Step 0: 初始化 ----
         if not self.ground_z_initialized and laser_distance > 0.1:
             self.ref_ground_z = ekf_z + laser_distance
             self.ground_z_initialized = True
-            self.prev_laser_distance = laser_distance
-            self.filtered_laser_height = ekf_z
-            self.filtered_laser_innovation = 0.0
+            self.fast_laser_height = ekf_z
+            self.slow_laser_height = ekf_z
             self.get_logger().info(
                 f"[LaserHgt] Ground init: ref_z={self.ref_ground_z:.3f} "
-                f"(ekf_z={ekf_z:.3f}, laser={laser_distance:.3f})"
+                f"(z={ekf_z:.3f}, laser={laser_distance:.3f})"
             )
             return ekf_z
 
         if not self.ground_z_initialized:
             return None
 
-        # Step 1: IMU预测激光变化
-        if self.prev_laser_distance > 0:
-            predicted_laser = self.prev_laser_distance - vz * dt
-        else:
-            predicted_laser = laser_distance
-
-        laser_innovation = laser_distance - predicted_laser
-
-        # LPF平滑innovation (过滤激光50Hz噪声)
-        alpha_innov = 0.2
-        self.filtered_laser_innovation = (
-            (1.0 - alpha_innov) * self.filtered_laser_innovation
-            + alpha_innov * laser_innovation
-        )
-        self.prev_laser_distance = laser_distance
-
-        # Step 2: 异常检测
-        innovation_trigger = (
-            abs(self.filtered_laser_innovation) > self.car_height_threshold
-        )
-
-        # Step 3: 激光推算高度
+        # ---- Step 1: 激光推算高度 ----
         laser_height_raw = self.ref_ground_z - laser_distance
-        alpha = 0.15  # ~3Hz @ 50Hz
-        if self.filtered_laser_height is None:
-            self.filtered_laser_height = laser_height_raw
+
+        # 标记输出滤波器 (α=0.15, ~3Hz)
+        if self.fast_laser_height is None:
+            self.fast_laser_height = laser_height_raw
         else:
-            self.filtered_laser_height = (
-                (1.0 - alpha) * self.filtered_laser_height
-                + alpha * laser_height_raw
+            self.fast_laser_height = (
+                0.85 * self.fast_laser_height + 0.15 * laser_height_raw
             )
 
-        # Step 4: 状态机
-        if innovation_trigger:
+        # 稳态参考滤波器 (α=0.005, ~0.04Hz, 50帧才明显响应)
+        if self.slow_laser_height is None:
+            self.slow_laser_height = laser_height_raw
+        else:
+            self.slow_laser_height = (
+                0.995 * self.slow_laser_height + 0.005 * laser_height_raw
+            )
+
+        # ---- Step 2: 双时间常数异常检测 ----
+        # 小车出现 → raw突变 → fast很快响应, slow几乎不变
+        # → |fast - slow| 持续多帧 → 可靠检测 (不再依赖单帧innovation!)
+        height_divergence = self.fast_laser_height - self.slow_laser_height
+        anomaly_this_frame = (
+            abs(height_divergence) > self.car_height_threshold
+        )
+
+        # ---- Step 3: 状态机 ----
+        if anomaly_this_frame:
             self.normal_frame_count = 0
             self.anomaly_frame_count += 1
             if self.anomaly_frame_count > self.confirm_frames + 5:
@@ -182,14 +179,16 @@ class Ekf2LinkDDS(Node):
             if not self.anomaly_active and \
                self.anomaly_frame_count >= self.confirm_frames:
                 self.anomaly_active = True
+                # 瞬间修正ref_ground_z到新表面
+                self.ref_ground_z -= height_divergence
+                # 重置滤波器, 消除收敛延迟
+                self.fast_laser_height = self.ref_ground_z - laser_distance
+                self.slow_laser_height = self.fast_laser_height
                 self.get_logger().warn(
                     f"[LaserHgt] CAR DETECTED! "
-                    f"innov={self.filtered_laser_innovation:+.2f}m, "
-                    f"ref_ground_z adapting..."
+                    f"diverg={height_divergence:+.2f}m, "
+                    f"ref_ground_z→{self.ref_ground_z:.3f}"
                 )
-
-            # 用innovation更新ref_ground_z (零baro!)
-            self.ref_ground_z += self.filtered_laser_innovation
 
         else:
             self.anomaly_frame_count = max(0, self.anomaly_frame_count - 1)
@@ -205,11 +204,10 @@ class Ekf2LinkDDS(Node):
                     self.anomaly_frame_count = 0
                     self.normal_frame_count = 0
             else:
-                # 正常模式: 缓慢修正地面参考
-                alpha_ground = 0.005
-                self.ref_ground_z += self.filtered_laser_innovation * alpha_ground
+                # 正常模式: ref_ground_z缓慢跟踪地形渐变
+                self.ref_ground_z -= height_divergence * 0.005
 
-        return self.filtered_laser_height
+        return self.fast_laser_height
 
     # ==================== 主循环 ====================
 
