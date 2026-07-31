@@ -39,14 +39,10 @@ class Ekf2LinkDDS(Node):
 
         # ---- 激光高度参数 ----
         self.declare_parameter('use_laser_height', True)
-        self.declare_parameter('laser.car_height_threshold', 0.2)
-        self.declare_parameter('laser.confirm_frames', 3)
-        self.declare_parameter('laser.recovery_frames', 5)
+        self.declare_parameter('laser.surface_jump_threshold', 0.2)
 
         self.use_laser_height = self.get_parameter('use_laser_height').value
-        self.car_height_threshold = self.get_parameter('laser.car_height_threshold').value
-        self.confirm_frames = self.get_parameter('laser.confirm_frames').value
-        self.recovery_frames = self.get_parameter('laser.recovery_frames').value
+        self.surface_jump_threshold = self.get_parameter('laser.surface_jump_threshold').value
 
         # ---- TF 监听器 ----
         self.tf_buffer = tf2_ros.Buffer()
@@ -172,7 +168,7 @@ class Ekf2LinkDDS(Node):
         anomaly_this_frame = False
         if self.surface_motion_count >= 5:
             anomaly_this_frame = (
-                abs(self.surface_motion_accum) > self.car_height_threshold
+                abs(self.surface_motion_accum) > self.surface_jump_threshold
             )
             if anomaly_this_frame:
                 # 地面突变 → 修正ref_ground_z (符号: surface>0=地面升=小车出现)
@@ -187,11 +183,6 @@ class Ekf2LinkDDS(Node):
             # 重置累积器
             self.surface_motion_accum = 0.0
             self.surface_motion_count = 0
-
-        # ---- Step 3: 正常时缓慢修正地面参考 ----
-        if not anomaly_this_frame and not self.anomaly_active:
-            # 用surface_motion的慢速EMA来跟踪地形渐变
-            pass  # ref_ground_z 保持不变, 依赖异常检测时的大跳更新
 
         return self.fast_laser_height
 
