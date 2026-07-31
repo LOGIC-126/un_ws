@@ -181,6 +181,9 @@ class TFTrackingNode(Node):
         self._lost_start_time = None
         self._search_start_time = None
 
+        # 起飞后悬停计时
+        self._wait_start_time = None
+
         # 抛投计时
         self._drop_start_time = None
         self._drop_enter_time = None   # 进入DROP状态的时刻
@@ -508,17 +511,29 @@ class TFTrackingNode(Node):
             self.set_target_position(0.0, 0.0, self.takeoff_height)
 
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                self.get_logger().info("TAKEOFF → WAIT (到达起飞高度)")
+                self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停5s)")
                 self._record_hover_position()
                 self._reset_tracking_counters()
                 self._locked_target = None
+                self._wait_start_time = self.get_clock().now()
                 self.state = FlightState.WAIT
 
         # ============================
-        # WAIT: 悬停, 检测到小车即自动追踪
+        # WAIT: 悬停5s → 检测到小车即自动追踪
         # ============================
         elif self.state == FlightState.WAIT:
             self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
+
+            # 悬停5秒后再开始检测
+            if self._wait_start_time is not None:
+                hover_elapsed = (self.get_clock().now() - self._wait_start_time).nanoseconds * 1e-9
+                if hover_elapsed < 5.0:
+                    self.get_logger().info(
+                        f'[WAIT] 悬停等待 {hover_elapsed:.1f}s/5.0s...',
+                        throttle_duration_sec=1.0)
+                    return
+                else:
+                    self._wait_start_time = None  # 计时完成
 
             target = self._get_target_ned()
             if target is not None:
