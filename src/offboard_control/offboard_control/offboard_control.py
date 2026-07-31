@@ -50,6 +50,13 @@ class Land_Control(Node):
         self.declare_parameter('pid.ki_yaw', 0.03)
         self.declare_parameter('pid.kd_yaw', 0.05)
 
+        # —— 起飞阶段 PID (大增益大速度, 用于快速爬升) ——
+        self.declare_parameter('pid.takeoff.kp_z', 3.0)
+        self.declare_parameter('pid.takeoff.ki_z', 0.3)
+        self.declare_parameter('pid.takeoff.kd_z', 0.0)
+        self.declare_parameter('pid.takeoff.max_vertical_speed', 6.0)
+        self.declare_parameter('pid.takeoff.exit_threshold', 0.3)  # 距目标Z在此范围内退出起飞PID
+
         # 速度限制
         self.declare_parameter('pid.max_horizontal_speed', 4.0)
         self.declare_parameter('pid.max_vertical_speed', 3.0)
@@ -174,6 +181,11 @@ class Land_Control(Node):
         self.last_error_y = 0.0
         self.last_error_z = 0.0
         self.last_error_yaw = 0.0
+
+        # —— 起飞阶段状态 ——
+        self._in_takeoff_phase = False
+        self._takeoff_integral_z = 0.0
+        self._takeoff_last_error_z = 0.0
 
         # 积分饱和上限
         self.integral_max_x = self.max_horizontal_speed * 0.3
@@ -313,12 +325,15 @@ class Land_Control(Node):
         self.last_error_y = 0.0
         self.last_error_z = 0.0
         self.last_error_yaw = 0.0
-        
+
         # 同步清空滤波器状态，防止切回时产生跃变
         self.filtered_vx = self.vehicle_local_position.vx if hasattr(self.vehicle_local_position, 'vx') else 0.0
         self.filtered_vy = self.vehicle_local_position.vy if hasattr(self.vehicle_local_position, 'vy') else 0.0
         self.filtered_vz = self.vehicle_local_position.vz if hasattr(self.vehicle_local_position, 'vz') else 0.0
         self.filtered_yawspeed = 0.0
+
+        # 同时重置起飞 PID
+        self._reset_takeoff_pid()
 
     @staticmethod
     def _yaw_error_wrap(target: float, current: float) -> float:
@@ -356,6 +371,37 @@ class Land_Control(Node):
         output = max(-max_out, min(max_out, output))
 
         return output
+
+    def _pid_step_z_takeoff(self, setpoint: float, measurement: float, dt: float) -> float:
+        """起飞阶段 Z 轴专用 PID, 高增益 + 高速度上限"""
+        error = setpoint - measurement
+
+        # 从参数读取起飞增益
+        kp = self.get_parameter('pid.takeoff.kp_z').value
+        ki = self.get_parameter('pid.takeoff.ki_z').value
+        kd = self.get_parameter('pid.takeoff.kd_z').value
+        max_speed = self.get_parameter('pid.takeoff.max_vertical_speed').value
+
+        p_out = kp * error
+
+        self._takeoff_integral_z += error * dt
+        integral_max = max_speed * 0.3
+        self._takeoff_integral_z = max(-integral_max,
+                                        min(integral_max, self._takeoff_integral_z))
+        i_out = ki * self._takeoff_integral_z
+
+        derivative = ((error - self._takeoff_last_error_z) / dt) if dt > 0.0 else 0.0
+        self._takeoff_last_error_z = error
+        d_out = kd * derivative
+
+        output = p_out + i_out + d_out
+        output = max(-max_speed, min(max_speed, output))
+        return output
+
+    def _reset_takeoff_pid(self):
+        """重置起飞 PID 状态"""
+        self._takeoff_integral_z = 0.0
+        self._takeoff_last_error_z = 0.0
 
     # ===================================================================
     # 【新增】双重平滑处理函数 (RC低通滤波 + 斜率限制)
@@ -453,6 +499,7 @@ class Land_Control(Node):
             if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self._reset_pid()
+                self._in_takeoff_phase = True   # 进入起飞阶段, 使用高增益 PID
                 self.engage_offboard_mode()
                 self.arm()
                 self.arm_time = self.get_clock().now()  # 记录解锁时刻
@@ -493,8 +540,21 @@ class Land_Control(Node):
                     # PID: Z轴直接使用EKF融合高度(ekf2_link_dds以vision方式提供激光定高)
                     raw_vx = self._pid_step('x', tar_x, curr_x, dt)
                     raw_vy = self._pid_step('y', tar_y, curr_y, dt)
-                    raw_vz = self._pid_step('z', tar_z, curr_z, dt)
                     raw_yr = self._pid_step('yaw', tar_yaw, curr_yaw, dt)
+
+                    # Z轴: 起飞阶段使用高增益大速度PID, 到达目标高度后切回正常PID
+                    if self._in_takeoff_phase:
+                        raw_vz = self._pid_step_z_takeoff(tar_z, curr_z, dt)
+                        exit_thr = self.get_parameter('pid.takeoff.exit_threshold').value
+                        if abs(tar_z - curr_z) < exit_thr:
+                            self._in_takeoff_phase = False
+                            self._reset_takeoff_pid()
+                            self.get_logger().info(
+                                f'起飞阶段结束 (Z误差={abs(tar_z - curr_z):.2f}m < {exit_thr}m), '
+                                '切换回正常 PID')
+                            raw_vz = self._pid_step('z', tar_z, curr_z, dt)
+                    else:
+                        raw_vz = self._pid_step('z', tar_z, curr_z, dt)
 
                 # ===========================================================
                 # 【拦截点】不管哪种速度源，发送前均进行物理平滑与滤波处理
