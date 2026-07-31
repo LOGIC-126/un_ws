@@ -133,16 +133,18 @@ class Ekf2LinkDDS(Node):
 
         ekf_z = self.vehicle_local_pos.z
 
-        # 初始化地面参考 (仅一次)
+        # 初始化地面参考 (仅一次, 不依赖baro)
+        # 无人机在地面时 laser=安装偏移, 直接以此为 ref_ground_z
+        # 飞行中: laser_height = ref_ground_z - laser_distance, 偏移自然抵消
         if not self.ground_z_initialized and laser_distance > 0.1:
-            self.ref_ground_z = ekf_z + laser_distance
+            self.ref_ground_z = laser_distance
             self.ground_z_initialized = True
-            self.filtered_laser_height = ekf_z
+            self.filtered_laser_height = 0.0  # 在地面,高度为0
             self.get_logger().info(
                 f"[LaserHgt] Init: ref_z={self.ref_ground_z:.3f} "
-                f"(z={ekf_z:.3f}, laser={laser_distance:.3f})"
+                f"(laser={laser_distance:.3f}, baro_z={ekf_z:.3f} ignored)"
             )
-            return ekf_z
+            return 0.0
 
         if not self.ground_z_initialized:
             return None
