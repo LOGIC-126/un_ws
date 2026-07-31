@@ -51,11 +51,12 @@ class Land_Control(Node):
         self.declare_parameter('pid.kd_yaw', 0.05)
 
         # —— 起飞阶段 PID (大增益大速度, 用于快速爬升) ——
-        self.declare_parameter('pid.takeoff.kp_z', 2.5)
-        self.declare_parameter('pid.takeoff.ki_z', 0.3)
+        self.declare_parameter('pid.takeoff.kp_z', 1.8)
+        self.declare_parameter('pid.takeoff.ki_z', 0.15)
         self.declare_parameter('pid.takeoff.kd_z', 0.0)
-        self.declare_parameter('pid.takeoff.max_vertical_speed', 3.0)
-        self.declare_parameter('pid.takeoff.exit_threshold', 0.3)  # 距目标Z在此范围内退出起飞PID
+        self.declare_parameter('pid.takeoff.max_vertical_speed', 1.5)
+        self.declare_parameter('pid.takeoff.exit_threshold', 0.5)   # 距目标Z在此范围内退出起飞PID
+        self.declare_parameter('pid.takeoff.exit_max_vz', 0.3)      # 退出前必须减速到此速度以下
 
         # 速度限制
         self.declare_parameter('pid.max_horizontal_speed', 4.0)
@@ -542,16 +543,19 @@ class Land_Control(Node):
                     raw_vy = self._pid_step('y', tar_y, curr_y, dt)
                     raw_yr = self._pid_step('yaw', tar_yaw, curr_yaw, dt)
 
-                    # Z轴: 起飞阶段使用高增益大速度PID, 到达目标高度后切回正常PID
+                    # Z轴: 起飞阶段使用高增益大速度PID, 到达目标高度+减速后切回正常PID
                     if self._in_takeoff_phase:
                         raw_vz = self._pid_step_z_takeoff(tar_z, curr_z, dt)
                         exit_thr = self.get_parameter('pid.takeoff.exit_threshold').value
-                        if abs(tar_z - curr_z) < exit_thr:
+                        exit_max_vz = self.get_parameter('pid.takeoff.exit_max_vz').value
+                        curr_vz = self.vehicle_local_position.vz
+                        # 双重条件: 位置接近 AND 速度已降低, 防止冲顶
+                        if abs(tar_z - curr_z) < exit_thr and abs(curr_vz) < exit_max_vz:
                             self._in_takeoff_phase = False
                             self._reset_takeoff_pid()
                             self.get_logger().info(
-                                f'起飞阶段结束 (Z误差={abs(tar_z - curr_z):.2f}m < {exit_thr}m), '
-                                '切换回正常 PID')
+                                f'起飞阶段结束 (Z误差={abs(tar_z - curr_z):.2f}m, '
+                                f'vz={abs(curr_vz):.2f}m/s) → 切换回正常 PID')
                             raw_vz = self._pid_step('z', tar_z, curr_z, dt)
                     else:
                         raw_vz = self._pid_step('z', tar_z, curr_z, dt)
