@@ -95,6 +95,7 @@ class TFTrackingNode(Node):
         self.drop_dwell_time = self.get_parameter('drop_dwell_time').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
         self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
+        self.land_low_height = -0.3  # 降落过渡高度 NED (30cm, 先PID慢降到此再触发land)
 
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
@@ -178,6 +179,7 @@ class TFTrackingNode(Node):
         # 抛投计时
         self._drop_start_time = None
         self._drop_enter_time = None   # 进入DROP状态的时刻
+        self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
 
         # 悬停位置
         self._hover_x = 0.0
@@ -638,11 +640,12 @@ class TFTrackingNode(Node):
             self.set_target_position(0.0, 0.0, self.takeoff_height)
 
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                self.get_logger().info('RTH → LAND (到达起飞点, 开始降落)')
+                self.get_logger().info('RTH → LAND (到达起飞点, 开始两段式降落)')
+                self._land_stage = 0
                 self.state = FlightState.LAND
 
         # ============================
-        # LAND: 降落 — Z=0 触发 offboard_control 的 land()
+        # LAND: 两段式降落 — PID慢降至低空 → 触发PX4 land
         # ============================
         elif self.state == FlightState.LAND:
             # 持续发送抛投完成信号给小车
@@ -650,10 +653,22 @@ class TFTrackingNode(Node):
             msg.data = 1
             self.drop_complete_pub.publish(msg)
 
-            self.get_logger().info(
-                '[LAND] 降落中...',
-                throttle_duration_sec=2.0)
-            self.set_target_position(0.0, 0.0, 0.0)
+            if self._land_stage == 0:
+                # 阶段0: PID 慢降至过渡高度 (默认 -0.3m = 30cm)
+                self.get_logger().info(
+                    f'[LAND] 阶段0: PID慢降至 {abs(self.land_low_height):.1f}m...',
+                    throttle_duration_sec=2.0)
+                self.set_target_position(0.0, 0.0, self.land_low_height)
+
+                if self.check_arrived(0.0, 0.0, self.land_low_height):
+                    self.get_logger().info('LAND 阶段0完成 → 阶段1: 触发 PX4 land')
+                    self._land_stage = 1
+            else:
+                # 阶段1: Z=0 触发 offboard_control 的 land() 指令
+                self.get_logger().info(
+                    '[LAND] 阶段1: 触发 PX4 降落模式',
+                    throttle_duration_sec=2.0)
+                self.set_target_position(0.0, 0.0, 0.0)
 
 
 def main(args=None):
