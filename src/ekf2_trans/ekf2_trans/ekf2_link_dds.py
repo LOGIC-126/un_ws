@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import tf2_ros
 from px4_msgs.msg import VehicleOdometry, DistanceSensor, VehicleLocalPosition
+from nav_msgs.msg import Odometry
 from tf2_ros import TransformException
 import tf_transformations
 import math
@@ -38,6 +39,18 @@ class Ekf2LinkDDS(Node):
         self.source_frame = self.get_parameter('source_frame').value
         self.frequency = self.get_parameter('publish_frequency').value
         self.use_laser_height = self.get_parameter('use_laser_height').value
+
+        # ---- 小车高度补偿 (默认关闭, 需同时订阅 /car/odom) ----
+        self.declare_parameter('use_car_compensation', False)
+        self.declare_parameter('car.compensation_distance', 0.5)   # 水平距离阈值(m)
+        self.declare_parameter('car.compensation_height', 0.3)     # 高度补偿量(m)
+        self.declare_parameter('car.offset_x', 0.6)                # odom→map X偏移(前+)
+        self.declare_parameter('car.offset_y', -0.36)              # odom→map Y偏移(左+右-)
+        self.use_car_comp = self.get_parameter('use_car_compensation').value
+        self.car_comp_dist = self.get_parameter('car.compensation_distance').value
+        self.car_comp_height = self.get_parameter('car.compensation_height').value
+        self.car_offset_x = self.get_parameter('car.offset_x').value
+        self.car_offset_y = self.get_parameter('car.offset_y').value
 
         # ---- TF 监听器 ----
         self.tf_buffer = tf2_ros.Buffer()
@@ -63,6 +76,14 @@ class Ekf2LinkDDS(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, self.qos_profile)
 
+        # ---- 小车位置 (补偿用) ----
+        self.car_odom_sub = self.create_subscription(
+            Odometry, '/car/odom', self.car_odom_callback, 10)
+        self.car_x = 0.0
+        self.car_y = 0.0
+        self.car_position_valid = False
+        self.car_comp_active = False     # 当前是否在补偿区内
+
         # ---- 激光高度状态 ----
         self.raw_laser_distance = -1.0
         self.laser_distance_valid = False
@@ -74,9 +95,16 @@ class Ekf2LinkDDS(Node):
         # ---- 定时器 ----
         self.timer = self.create_timer(1.0 / self.frequency, self.timer_callback)
 
-        self.get_logger().info(
-            f"DDS视觉里程计启动 (laser={'ON' if self.use_laser_height else 'OFF'})"
-        )
+        self.get_logger().info("=" * 55)
+        self.get_logger().info("  DDS 视觉里程计 + 激光高度源")
+        self.get_logger().info(f"  laser_height: {'ON' if self.use_laser_height else 'OFF'}")
+        if self.use_car_comp:
+            self.get_logger().info("  ★ CAR COMPENSATION MODE ★")
+            self.get_logger().info(f"    dist<{self.car_comp_dist}m → height-{self.car_comp_height}m")
+            self.get_logger().info(f"    odom→map offset: x={self.car_offset_x}, y={self.car_offset_y}")
+        else:
+            self.get_logger().info("  car_compensation: OFF")
+        self.get_logger().info("=" * 55)
 
     # ==================== 回调 ====================
 
@@ -90,6 +118,11 @@ class Ekf2LinkDDS(Node):
     def vehicle_local_position_callback(self, msg: VehicleLocalPosition) -> None:
         self.vehicle_local_pos = msg
 
+    def car_odom_callback(self, msg: Odometry) -> None:
+        self.car_x = msg.pose.pose.position.x
+        self.car_y = msg.pose.pose.position.y
+        self.car_position_valid = True
+
     # ==================== 激光高度 ====================
 
     def _update_laser_height(self, laser_distance: float) -> float:
@@ -101,16 +134,18 @@ class Ekf2LinkDDS(Node):
 
         ekf_z = self.vehicle_local_pos.z
 
-        # 初始化地面参考 (仅一次)
+        # 初始化地面参考 (仅一次, 不依赖baro)
+        # 无人机在地面时 laser=安装偏移, 直接以此为 ref_ground_z
+        # 飞行中: laser_height = ref_ground_z - laser_distance, 偏移自然抵消
         if not self.ground_z_initialized and laser_distance > 0.1:
-            self.ref_ground_z = ekf_z + laser_distance
+            self.ref_ground_z = laser_distance
             self.ground_z_initialized = True
-            self.filtered_laser_height = ekf_z
+            self.filtered_laser_height = 0.0  # 在地面,高度为0
             self.get_logger().info(
                 f"[LaserHgt] Init: ref_z={self.ref_ground_z:.3f} "
-                f"(z={ekf_z:.3f}, laser={laser_distance:.3f})"
+                f"(laser={laser_distance:.3f}, baro_z={ekf_z:.3f} ignored)"
             )
-            return ekf_z
+            return 0.0
 
         if not self.ground_z_initialized:
             return None
@@ -155,10 +190,35 @@ class Ekf2LinkDDS(Node):
             odom_msg.timestamp_sample = odom_msg.timestamp
             odom_msg.pose_frame = VehicleOdometry.POSE_FRAME_NED
 
-            odom_msg.position = [
-                t.x, -t.y,
-                laser_z if (laser_z is not None) else float('nan')
-            ]
+            # ---- 小车高度补偿: drone接近小车时自动下调高度 ----
+            comp_z = laser_z
+            if self.use_car_comp and laser_z is not None and self.car_position_valid:
+                car_x_map = self.car_x + self.car_offset_x
+                car_y_map = self.car_y + self.car_offset_y
+                dist = math.hypot(t.x - car_x_map, t.y - car_y_map)
+                in_zone = dist < self.car_comp_dist
+
+                if in_zone and not self.car_comp_active:
+                    self.car_comp_active = True
+                    self.get_logger().warn(
+                        f"★★★ ENTER CAR ZONE! dist={dist:.2f}m, "
+                        f"height -{self.car_comp_height}m ★★★"
+                    )
+                elif not in_zone and self.car_comp_active:
+                    self.car_comp_active = False
+                    self.get_logger().info(
+                        f"    exit car zone, dist={dist:.2f}m"
+                    )
+
+                # 直接补偿: 激光骤减0.3m → 补偿+0.3m → 精确抵消 → EKF无感
+                if in_zone:
+                    comp_z = laser_z - self.car_comp_height
+                    self.get_logger().info(
+                        f"[Comp] d={dist:.2f}m → z={comp_z:.3f}",
+                        throttle_duration_sec=1.0
+                    )
+
+            odom_msg.position = [t.x, -t.y, comp_z if (comp_z is not None) else float('nan')]
 
             px4_yaw = -yaw_ros
             q_ned = tf_transformations.quaternion_from_euler(0.0, 0.0, px4_yaw)
