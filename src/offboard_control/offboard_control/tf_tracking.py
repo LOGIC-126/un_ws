@@ -85,10 +85,9 @@ class TFTrackingNode(Node):
         self.declare_parameter('rth_offset_x', -0.15)   # 返航点X偏移 NED (往后退, m)
         self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
 
-        # —— 视觉融合 ——
-        self.declare_parameter('enable_vision_fusion', False)
-        self.declare_parameter('fusion_alpha', 0.8)
-        self.declare_parameter('vision_match_threshold', 1.5)
+        # —— 视觉融合 (参考 yolo_tracking.py TRACK 视觉追踪逻辑) ——
+        self.declare_parameter('enable_vision_fusion', True)
+        self.declare_parameter('vision_match_threshold', 0.2)  # 识别与TF一致时用识别值代替(参考yolo_tracking)
         self.declare_parameter('fence_radius', 1.5)
 
         # 读取参数值
@@ -114,7 +113,6 @@ class TFTrackingNode(Node):
         self.max_distance = self.get_parameter('max_distance').value
 
         self.enable_vision_fusion = self.get_parameter('enable_vision_fusion').value
-        self.fusion_alpha = self.get_parameter('fusion_alpha').value
         self.vision_match_threshold = self.get_parameter('vision_match_threshold').value
         self.fence_radius = self.get_parameter('fence_radius').value
 
@@ -150,13 +148,11 @@ class TFTrackingNode(Node):
             VehicleStatus, '/fmu/out/vehicle_status_v2',
             self.vehicle_status_callback, qos_profile)
 
-        # —— YOLO 视觉检测 (可选, 融合模式) ——
-        if self.enable_vision_fusion:
-            self.world_coords_sub = self.create_subscription(
-                PoseArray, '/detection/world_coordinates',
-                self.world_coordinates_callback, 10)
-        else:
-            self.world_coords_sub = None
+        # —— YOLO 视觉检测 (始终订阅, 参考 yolo_tracking.py TRACK 视觉追踪) ——
+        # 数据来源: rknn_yolo/yolo_detector_node.cpp → detection_world_node → /detection/world_coordinates
+        self.world_coords_sub = self.create_subscription(
+            PoseArray, '/detection/world_coordinates',
+            self.world_coordinates_callback, 10)
 
         # —— 小车启动触发 (waypoint_tracker 行驶≥0.5m 后发布) ——
         # _car_mode: 0=未触发, 1=模式1(跟踪抛投), 2=模式2(跟踪起降, 当前仅追踪)
@@ -343,7 +339,8 @@ class TFTrackingNode(Node):
         获取追踪目标 NED 坐标。
 
         纯 TF 模式: 直接返回 TF 查询结果
-        融合模式: TF + YOLO 互补滤波
+        融合模式: TF 为主, 识别值与 TF 一致(≤vision_match_threshold)时用识别值代替
+                  (参考 yolo_tracking.py TRACK 状态 L341-385: 视觉检测→锁定→追踪)
 
         返回 (ned_x, ned_y, distance) 或 None
         """
@@ -362,16 +359,19 @@ class TFTrackingNode(Node):
         if dist > self.max_distance:
             return None
 
-        # —— 视觉融合 ——
+        # —— 视觉融合 (参考 yolo_tracking.py _select_nearest_target L180-210) ——
+        # 识别值与TF坐标相距≤阈值(0.2m) → 用识别值代替TF追踪
         if self.enable_vision_fusion and self._latest_detections is not None:
             yolo_target = self._match_vision_to_car(car)
             if yolo_target is not None:
                 yolo_x, yolo_y = yolo_target
-                alpha = self.fusion_alpha
-                fused_x = alpha * car[0] + (1.0 - alpha) * yolo_x
-                fused_y = alpha * car[1] + (1.0 - alpha) * yolo_y
-                fused_dist = math.hypot(fused_x - drone.x, fused_y - drone.y)
-                return (fused_x, fused_y, fused_dist)
+                d_vision_tf = math.hypot(yolo_x - car[0], yolo_y - car[1])
+                self.get_logger().info(
+                    f'视觉替用: 识别→TF偏移={d_vision_tf:.2f}m≤{self.vision_match_threshold}m, '
+                    f'使用识别值 NED({yolo_x:.2f}, {yolo_y:.2f})',
+                    throttle_duration_sec=1.0)
+                yolo_dist = math.hypot(yolo_x - drone.x, yolo_y - drone.y)
+                return (yolo_x, yolo_y, yolo_dist)
 
         return (car[0], car[1], dist)
 
