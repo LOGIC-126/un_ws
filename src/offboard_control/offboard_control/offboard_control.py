@@ -123,7 +123,6 @@ class Land_Control(Node):
 
         self.has_target_altitude = False
         self.arm_time = None  # 记录解锁时间戳，防止 disarm 秒杀（offboard 切换有延迟）
-
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
         self.last_velocity_time = self.get_clock().now()
