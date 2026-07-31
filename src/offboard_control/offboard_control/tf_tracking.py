@@ -191,8 +191,8 @@ class TFTrackingNode(Node):
         # —— 舵机串口 (抛投机构) ——
         self.servo_serial = None
         try:
-            self.servo_serial = serial.Serial('/dev/ttyS3', 115200, timeout=0.1)
-            self.get_logger().info('舵机串口 /dev/ttyS3@115200 已打开')
+            self.servo_serial = serial.Serial('/dev/ttyS0', 115200, timeout=0.1)
+            self.get_logger().info('舵机串口 /dev/ttyS0@115200 已打开')
         except serial.SerialException as e:
             self.get_logger().warn(f'舵机串口打开失败: {e}')
 
