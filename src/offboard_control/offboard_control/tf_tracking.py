@@ -35,7 +35,7 @@ from tf2_ros import TransformException
 from tf2_msgs.msg import TFMessage
 import tf_transformations
 
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, VehicleCommand
 from std_msgs.msg import Int32
 from geometry_msgs.msg import Pose, PoseArray
 
@@ -133,6 +133,8 @@ class TFTrackingNode(Node):
             Pose, '/uav/target_position', qos_profile)
         self.drop_complete_pub = self.create_publisher(
             Int32, '/car/drop_complete', 10)
+        self.vehicle_cmd_pub = self.create_publisher(
+            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
 
         # ====== 订阅器 ======
         self.vehicle_local_pos_sub = self.create_subscription(
@@ -181,6 +183,7 @@ class TFTrackingNode(Node):
         self._drop_start_time = None
         self._drop_enter_time = None   # 进入DROP状态的时刻
         self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
+        self._disarm_sent = False      # disarm 只发一次
 
         # 悬停位置
         self._hover_x = 0.0
@@ -683,7 +686,20 @@ class TFTrackingNode(Node):
             self.get_logger().info(
                 '[DONE] 任务完成.',
                 throttle_duration_sec=5.0)
-            # 不发目标位置, offboard_control 的 is_landed+not in_offboard → 3s → disarm
+
+            if not self._disarm_sent:
+                self.get_logger().info('[DONE] 发送 disarm 锁桨')
+                cmd = VehicleCommand()
+                cmd.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
+                cmd.param1 = 0.0   # 0=disarm
+                cmd.target_system = 1
+                cmd.target_component = 1
+                cmd.source_system = 1
+                cmd.source_component = 1
+                cmd.from_external = True
+                cmd.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+                self.vehicle_cmd_pub.publish(cmd)
+                self._disarm_sent = True
 
 
 def main(args=None):
