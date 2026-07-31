@@ -71,6 +71,10 @@ class TFTrackingNode(Node):
         self.declare_parameter('drone_frame', 'base_link')
         self.declare_parameter('car_frame', 'base_footprint')  # 小车 frame (通常 base_footprint)
 
+        # —— 小车 odom→map 偏移 (与 ekf2_link_dds.py 一致) ——
+        self.declare_parameter('car.offset_x', 0.6)   # odom→map X偏移(前+)
+        self.declare_parameter('car.offset_y', -0.36)  # odom→map Y偏移(左+右-)
+
         # —— 追踪参数 ——
         self.declare_parameter('max_distance', 15.0)
 
@@ -90,6 +94,8 @@ class TFTrackingNode(Node):
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
         self.car_frame = self.get_parameter('car_frame').value
+        self.car_offset_x = self.get_parameter('car.offset_x').value
+        self.car_offset_y = self.get_parameter('car.offset_y').value
         self.max_distance = self.get_parameter('max_distance').value
 
         self.enable_vision_fusion = self.get_parameter('enable_vision_fusion').value
@@ -223,6 +229,9 @@ class TFTrackingNode(Node):
         与 ekf2_link_dds.py:222 相同的 FLU→NED 转换:
           ned_x = ros_x,  ned_y = -ros_y
 
+        小车 odom→map 偏移 (与 ekf2_link_dds.py 一致):
+          car_map = car_tf + (car_offset_x, car_offset_y)
+
         返回 (ned_x, ned_y) 或 None
         """
         try:
@@ -234,13 +243,13 @@ class TFTrackingNode(Node):
             drone_map_x = drone_tf.transform.translation.x
             drone_map_y = drone_tf.transform.translation.y
 
-            # 2. 查询小车在 map 帧的位姿
+            # 2. 查询小车在 TF 中的位姿 (odom帧) + odom→map 偏移 = map帧
             car_tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.car_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.05))
-            car_map_x = car_tf.transform.translation.x
-            car_map_y = car_tf.transform.translation.y
+            car_map_x = car_tf.transform.translation.x + self.car_offset_x
+            car_map_y = car_tf.transform.translation.y + self.car_offset_y
 
         except TransformException as e:
             self.get_logger().warn(
