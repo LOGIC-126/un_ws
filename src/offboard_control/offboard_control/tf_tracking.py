@@ -91,7 +91,7 @@ class TFTrackingNode(Node):
         self.search_timeout = self.get_parameter('search_timeout').value
         self.drop_distance_threshold = self.get_parameter('drop_distance_threshold').value
         self.drop_dwell_time = self.get_parameter('drop_dwell_time').value
-        self.drop_height = -1.0   # 抛投高度 NED (1m)
+        self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
 
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
@@ -417,12 +417,19 @@ class TFTrackingNode(Node):
             dx = car[0] - drone.x
             dy = car[1] - drone.y
             dist = math.hypot(dx, dy)
+            # 抛投接近提示
+            drop_hint = ""
+            if self.state == FlightState.TRACK and self._drop_start_time is not None:
+                dwell = (now - self._drop_start_time).nanoseconds * 1e-9
+                drop_hint = f" | 抛投倒计时 {dwell:.1f}s/{self.drop_dwell_time}s (阈值{self.drop_distance_threshold}m)"
+            elif self.state == FlightState.DROP:
+                drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
                 f"小车 NED({car[0]:.2f}, {car[1]:.2f}) | "
                 f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
-                f"距离={dist:.2f}m"
+                f"距离={dist:.2f}m{drop_hint}"
             )
         else:
             self.get_logger().info(

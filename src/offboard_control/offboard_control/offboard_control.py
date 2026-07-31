@@ -473,7 +473,8 @@ class Land_Control(Node):
             f"--- UAV STATUS --- "
             f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
             f"Nav: {self.vehicle_status.nav_state} | "
-            f"Ctrl: {cmd_label}"
+            f"Ctrl: {cmd_label}",
+            throttle_duration_sec=2.0,
         )
 
         if self.offboard_setpoint_counter < 10:
