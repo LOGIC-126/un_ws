@@ -44,3 +44,11 @@
     filter.max_accel_horizontal: 5.0
     filter.max_accel_vertical: 4.0
     filter.max_accel_yaw: 1.5
+
+    # --- DistBottom 异常检测 (抗小车高度干扰, 策略B: raw laser) ---
+    # 飞控端需配合设置: EKF2_RNG_CTRL=0 (禁用EKF激光融合), EKF2_HGT_REF=0 (Baro)
+    anomaly.enabled: true                   # 总开关: 是否启用异常检测
+    anomaly.car_height_threshold: 0.2       # 激光与baro差异阈值(m), 需<车高(~30cm)确保触发, 留10cm余量
+    anomaly.confirm_frames: 3               # 连续异常帧数确认 (50Hz时=60ms防抖)
+    anomaly.recovery_frames: 5              # 连续正常帧数恢复 (50Hz时=100ms消抖)
+    anomaly.freeze_integral: true           # 异常期间冻结Z轴积分, 防止windup
