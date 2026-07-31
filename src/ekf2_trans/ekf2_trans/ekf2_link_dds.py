@@ -16,6 +16,7 @@ TF→PX4视觉里程计桥接节点 + 激光高度源.
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import tf2_ros
 from px4_msgs.msg import VehicleOdometry, DistanceSensor, VehicleLocalPosition
 from tf2_ros import TransformException
@@ -53,17 +54,25 @@ class Ekf2LinkDDS(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        # ---- QoS (匹配PX4 BEST_EFFORT) ----
+        self.qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # ---- 发布者 ----
         self.odom_pub = self.create_publisher(
             VehicleOdometry, '/fmu/in/vehicle_visual_odometry', 10)
 
-        # ---- 订阅者 ----
+        # ---- 订阅者 (BEST_EFFORT匹配PX4) ----
         self.distance_sensor_sub = self.create_subscription(
             DistanceSensor, '/fmu/out/distance_sensor',
-            self.distance_sensor_callback, 10)
+            self.distance_sensor_callback, self.qos_profile)
         self.vehicle_local_position_sub = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
-            self.vehicle_local_position_callback, 10)
+            self.vehicle_local_position_callback, self.qos_profile)
 
         # ---- 激光高度检测器状态 (IMU预测+激光验证, 零baro) ----
         self.raw_laser_distance = -1.0
