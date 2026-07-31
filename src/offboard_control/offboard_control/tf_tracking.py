@@ -629,36 +629,13 @@ class TFTrackingNode(Node):
                     self.state = FlightState.WAIT
 
         # ============================
-        # DROP: 抛投 — 降低至0.5m高度, 持续追踪小车, 5s后返航
+        # DROP: 抛投 — 先降高→舵机抽拉→计时→返航
         # ============================
         elif self.state == FlightState.DROP:
-            # 计时
             if self._drop_enter_time is None:
                 self._drop_enter_time = self.get_clock().now()
 
-            # 首次进入 → 执行舵机抛投抽拉
-            if not self._drop_servo_done:
-                self._drop_servo_done = True
-                self._servo_drop()
-
-            elapsed = (self.get_clock().now() - self._drop_enter_time).nanoseconds * 1e-9
-
-            # 超时 → 返航
-            if elapsed >= self.rth_delay:
-                self.get_logger().info(f'DROP → RTH (抛投完成 {elapsed:.1f}s)')
-                # 发布抛投完成信号给小车
-                msg = Int32()
-                msg.data = 1
-                self.drop_complete_pub.publish(msg)
-                self._drop_enter_time = None
-                self.state = FlightState.RTH
-                return
-
-            # TODO: 实际抛投逻辑 (舵机/电磁铁/释放装置等)
-            self.get_logger().info(
-                f'[DROP] 抛投 {elapsed:.1f}s/{self.rth_delay}s...',
-                throttle_duration_sec=1.0)
-
+            # 持续追踪小车, 降到抛投高度
             target = self._get_target_ned()
             if target is not None:
                 ned_x, ned_y, _ = target
@@ -667,6 +644,35 @@ class TFTrackingNode(Node):
             elif self._locked_target is not None:
                 lx, ly = self._locked_target
                 self.set_target_position(lx, ly, self.drop_height)
+
+            # 到达抛投高度 → 执行舵机抽拉 (仅一次)
+            curr_z = self.vehicle_local_position.z
+            if not self._drop_servo_done and abs(curr_z - self.drop_height) < 0.2:
+                self._drop_servo_done = True
+                self.get_logger().info(f'到达抛投高度 (Z={curr_z:.2f}m), 执行舵机抽拉')
+                self._servo_drop()
+                # 重置计时器: 从抛投完成开始算 RTH 倒计时
+                self._drop_enter_time = self.get_clock().now()
+
+            # 抛投完成后计时 → 返航
+            if self._drop_servo_done:
+                elapsed = (self.get_clock().now() - self._drop_enter_time).nanoseconds * 1e-9
+                self.get_logger().info(
+                    f'[DROP] 抛投完成, {elapsed:.1f}s/{self.rth_delay}s → RTH',
+                    throttle_duration_sec=1.0)
+                if elapsed >= self.rth_delay:
+                    self.get_logger().info(f'DROP → RTH (抛投完成 {elapsed:.1f}s)')
+                    msg = Int32()
+                    msg.data = 1
+                    self.drop_complete_pub.publish(msg)
+                    self._drop_enter_time = None
+                    self.state = FlightState.RTH
+                    return
+            else:
+                # 还在降高中
+                self.get_logger().info(
+                    f'[DROP] 降高中 Z={curr_z:.2f}→{self.drop_height:.1f}...',
+                    throttle_duration_sec=1.0)
 
         # ============================
         # RTH: 返航 — 返回起飞点 (0,0), 到达后降落
