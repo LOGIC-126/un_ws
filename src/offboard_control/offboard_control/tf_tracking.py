@@ -25,6 +25,8 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 """
 
 import math
+import time
+import serial
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -184,6 +186,15 @@ class TFTrackingNode(Node):
         self._drop_enter_time = None   # 进入DROP状态的时刻
         self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
         self._disarm_sent = False      # disarm 只发一次
+        self._servo_swept = False      # 启动舵机自检只做一次
+
+        # —— 舵机串口 (抛投机构) ——
+        self.servo_serial = None
+        try:
+            self.servo_serial = serial.Serial('/dev/ttyS3', 115200, timeout=0.1)
+            self.get_logger().info('舵机串口 /dev/ttyS3@115200 已打开')
+        except serial.SerialException as e:
+            self.get_logger().warn(f'舵机串口打开失败: {e}')
 
         # 悬停位置
         self._hover_x = 0.0
@@ -221,6 +232,29 @@ class TFTrackingNode(Node):
 
     def world_coordinates_callback(self, msg: PoseArray) -> None:
         self._latest_detections = msg
+
+    # ==================== 舵机控制 (抛投机构) ====================
+
+    def _servo_cmd(self, data: bytes):
+        """发送舵机指令"""
+        if self.servo_serial is None or not self.servo_serial.is_open:
+            return
+        try:
+            self.servo_serial.write(data)
+            self.get_logger().info(f'舵机发送: {data.hex(" ").upper()}')
+        except serial.SerialException as e:
+            self.get_logger().warn(f'舵机发送失败: {e}')
+
+    def _servo_sweep(self):
+        """上电自检: 正向+60° → 反向-60° → 回中"""
+        import time as _time
+        self.get_logger().info('舵机自检: 正向+60°')
+        self._servo_cmd(bytes([0xA5, 0x01, 0xA6]))
+        _time.sleep(0.5)
+        self.get_logger().info('舵机自检: 反向-60°')
+        self._servo_cmd(bytes([0xA5, 0x02, 0xA7]))
+        _time.sleep(0.5)
+        self.get_logger().info('舵机自检完成')
 
     # ==================== TF 查询 (参考 ekf2_link_dds.py:176-181) ====================
 
@@ -456,6 +490,11 @@ class TFTrackingNode(Node):
         # INIT: 地面等待小车 /car/trigger 启动信号
         # ============================
         if self.state == FlightState.INIT:
+            # 首次进入 INIT → 舵机上电自检 (来回活动一次)
+            if not self._servo_swept:
+                self._servo_swept = True
+                self._servo_sweep()
+
             self.set_target_position(0.0, 0.0, 0.0)
 
             if self._car_triggered:
