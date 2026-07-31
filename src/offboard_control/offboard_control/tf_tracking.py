@@ -21,7 +21,7 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 
 可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND (全自动, 无需RC)
+状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND → DONE (全自动, 无需RC)
 """
 
 import math
@@ -50,6 +50,7 @@ class FlightState(Enum):
     DROP = 5
     RTH = 6    # Return To Home 返航
     LAND = 7   # 降落
+    DONE = 8   # 任务完成
 
 
 class TFTrackingNode(Node):
@@ -394,7 +395,7 @@ class TFTrackingNode(Node):
         is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
         is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
-        if self.state != FlightState.INIT:
+        if self.state not in (FlightState.INIT, FlightState.DONE):
             if not is_armed or not is_offboard:
                 self.get_logger().warn("掉出 Offboard / 上锁状态, 退回 INIT.")
                 self.state = FlightState.INIT
@@ -664,11 +665,25 @@ class TFTrackingNode(Node):
                     self.get_logger().info('LAND 阶段0完成 → 阶段1: 触发 PX4 land')
                     self._land_stage = 1
             else:
-                # 阶段1: Z=0 触发 offboard_control 的 land() 指令
+                # 阶段1: Z=0 触发 offboard_control 的 land() → PX4 降落
                 self.get_logger().info(
-                    '[LAND] 阶段1: 触发 PX4 降落模式',
+                    '[LAND] 阶段1: PX4 降落中...',
                     throttle_duration_sec=2.0)
                 self.set_target_position(0.0, 0.0, 0.0)
+
+                # 检测落地: NED z 接近 0 → 切 DONE, 停发目标让 offboard_control disarm
+                if self.vehicle_local_position.z >= -0.15:
+                    self.get_logger().info('LAND → DONE (已着陆, 等待锁桨)')
+                    self.state = FlightState.DONE
+
+        # ============================
+        # DONE: 任务完成, 停发目标, 等待 offboard_control 自动 disarm
+        # ============================
+        elif self.state == FlightState.DONE:
+            self.get_logger().info(
+                '[DONE] 任务完成.',
+                throttle_duration_sec=5.0)
+            # 不发目标位置, offboard_control 的 is_landed+not in_offboard → 3s → disarm
 
 
 def main(args=None):
