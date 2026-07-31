@@ -32,10 +32,10 @@
     pid.kd_yaw: 0.05
 
     # --- 起飞阶段 PID (高增益大速度, 爬升完成后切回正常 PID) ---
-    pid.takeoff.kp_z: 1.8
-    pid.takeoff.ki_z: 0.15
+    pid.takeoff.kp_z: 1.5
+    pid.takeoff.ki_z: 0.1
     pid.takeoff.kd_z: 0.0
-    pid.takeoff.max_vertical_speed: 1.5
+    pid.takeoff.max_vertical_speed: 1.0
     pid.takeoff.exit_threshold: 0.5
     pid.takeoff.exit_max_vz: 0.3
 
