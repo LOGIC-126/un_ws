@@ -82,6 +82,7 @@ class Ekf2LinkDDS(Node):
         self.car_x = 0.0
         self.car_y = 0.0
         self.car_position_valid = False
+        self.car_comp_active = False     # 当前是否在补偿区内
 
         # ---- 激光高度状态 ----
         self.raw_laser_distance = -1.0
@@ -195,10 +196,24 @@ class Ekf2LinkDDS(Node):
                 car_x_map = self.car_x + self.car_offset_x
                 car_y_map = self.car_y + self.car_offset_y
                 dist = math.hypot(t.x - car_x_map, t.y - car_y_map)
-                if dist < self.car_comp_dist:
-                    comp_z = laser_z - self.car_comp_height  # NED: 补偿=更负
+                in_zone = dist < self.car_comp_dist
+
+                if in_zone and not self.car_comp_active:
+                    self.car_comp_active = True
+                    self.get_logger().warn(
+                        f"★★★ ENTER CAR ZONE! dist={dist:.2f}m, "
+                        f"height -{self.car_comp_height}m ★★★"
+                    )
+                elif not in_zone and self.car_comp_active:
+                    self.car_comp_active = False
                     self.get_logger().info(
-                        f"[Comp] dist={dist:.2f}m → comp_z={comp_z:.3f}",
+                        f"    exit car zone, dist={dist:.2f}m"
+                    )
+
+                if in_zone:
+                    comp_z = laser_z - self.car_comp_height
+                    self.get_logger().info(
+                        f"[Comp] dist={dist:.2f}m → z={comp_z:.3f}",
                         throttle_duration_sec=1.0
                     )
 
