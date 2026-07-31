@@ -51,10 +51,10 @@ class Land_Control(Node):
         self.declare_parameter('pid.kd_yaw', 0.05)
 
         # —— 起飞阶段 PID (大增益大速度, 用于快速爬升) ——
-        self.declare_parameter('pid.takeoff.kp_z', 3.0)
+        self.declare_parameter('pid.takeoff.kp_z', 2.5)
         self.declare_parameter('pid.takeoff.ki_z', 0.3)
         self.declare_parameter('pid.takeoff.kd_z', 0.0)
-        self.declare_parameter('pid.takeoff.max_vertical_speed', 6.0)
+        self.declare_parameter('pid.takeoff.max_vertical_speed', 3.0)
         self.declare_parameter('pid.takeoff.exit_threshold', 0.3)  # 距目标Z在此范围内退出起飞PID
 
         # 速度限制
