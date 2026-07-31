@@ -21,7 +21,7 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 
 可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST (全自动, 无需RC)
+状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP (全自动, 无需RC)
 """
 
 import math
@@ -47,6 +47,7 @@ class FlightState(Enum):
     WAIT = 2
     TRACK = 3
     LOST = 4
+    DROP = 5
 
 
 class TFTrackingNode(Node):
@@ -61,6 +62,8 @@ class TFTrackingNode(Node):
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('lost_timeout', 2.0)
         self.declare_parameter('search_timeout', 10.0)
+        self.declare_parameter('drop_distance_threshold', 0.5)
+        self.declare_parameter('drop_dwell_time', 3.0)
 
         # —— TF 帧配置 ——
         self.declare_parameter('map_frame', 'map')
@@ -86,6 +89,9 @@ class TFTrackingNode(Node):
         self.confirm_frames = self.get_parameter('confirm_frames').value
         self.lost_timeout = self.get_parameter('lost_timeout').value
         self.search_timeout = self.get_parameter('search_timeout').value
+        self.drop_distance_threshold = self.get_parameter('drop_distance_threshold').value
+        self.drop_dwell_time = self.get_parameter('drop_dwell_time').value
+        self.drop_height = -1.0   # 抛投高度 NED (1m)
 
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
@@ -163,6 +169,9 @@ class TFTrackingNode(Node):
         # 丢失计时
         self._lost_start_time = None
         self._search_start_time = None
+
+        # 抛投计时
+        self._drop_start_time = None
 
         # 悬停位置
         self._hover_x = 0.0
@@ -493,6 +502,21 @@ class TFTrackingNode(Node):
 
                 self.set_target_position(ned_x, ned_y, self.takeoff_height)
 
+                # 抛投检测: 接近小车超过 dwell 时间 → DROP
+                if dist < self.drop_distance_threshold:
+                    if self._drop_start_time is None:
+                        self._drop_start_time = self.get_clock().now()
+                    else:
+                        dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
+                        if dwell >= self.drop_dwell_time:
+                            self.get_logger().info(
+                                f'TRACK → DROP (距小车 {dist:.2f}m, 停留 {dwell:.1f}s)')
+                            self._drop_start_time = None
+                            self.state = FlightState.DROP
+                            return
+                else:
+                    self._drop_start_time = None
+
             else:
                 now = self.get_clock().now()
 
@@ -550,6 +574,24 @@ class TFTrackingNode(Node):
                     self._reset_tracking_counters()
                     self._locked_target = None
                     self.state = FlightState.WAIT
+
+        # ============================
+        # DROP: 抛投 — 降低至1m高度, 持续追踪小车
+        # ============================
+        elif self.state == FlightState.DROP:
+            # TODO: 实际抛投逻辑 (舵机/电磁铁/释放装置等)
+            self.get_logger().info(
+                '[DROP] 抛投任务执行中... (待实现具体抛投动作)',
+                throttle_duration_sec=3.0)
+
+            target = self._get_target_ned()
+            if target is not None:
+                ned_x, ned_y, _ = target
+                self._locked_target = (ned_x, ned_y)
+                self.set_target_position(ned_x, ned_y, self.drop_height)
+            elif self._locked_target is not None:
+                lx, ly = self._locked_target
+                self.set_target_position(lx, ly, self.drop_height)
 
 
 def main(args=None):
