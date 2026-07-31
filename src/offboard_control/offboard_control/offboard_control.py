@@ -497,18 +497,13 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                # 先切 offboard 模式, 等模式确认后再 arm (避免同周期 arm 被 PX4 拒绝)
-                if not in_offboard:
-                    self.get_logger().info(
-                        "Ground & Disarmed → 切 Offboard...",
-                        throttle_duration_sec=2.0)
-                    self.engage_offboard_mode()
-                else:
-                    # PX4 已进入 offboard, 现在发 arm
-                    self.get_logger().info("Offboard 已建立 → 发送 Arm")
-                    self._reset_pid()
-                    self._in_takeoff_phase = True
-                    self.arm()
+                self.get_logger().info(
+                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
+                    throttle_duration_sec=3.0)
+                self._reset_pid()
+                self._in_takeoff_phase = True
+                self.engage_offboard_mode()
+                self.arm()
             # 必须持续发 setpoint, PX4 才会接受 offboard 切换
             self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
@@ -619,14 +614,11 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                if not in_offboard:
-                    self.get_logger().info(
-                        "Ground & Disarmed → 切 Offboard...",
-                        throttle_duration_sec=2.0)
-                    self.engage_offboard_mode()
-                else:
-                    self.get_logger().info("Offboard 已建立 → 发送 Arm")
-                    self.arm()
+                self.get_logger().info(
+                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
+                    throttle_duration_sec=3.0)
+                self.engage_offboard_mode()
+                self.arm()
 
         elif in_offboard:
             self.arm_time = None  # offboard 已建立，清除计时

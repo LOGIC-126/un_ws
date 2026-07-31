@@ -737,13 +737,14 @@ class TFTrackingNode(Node):
                     self.state = FlightState.DONE
 
         # ============================
-        # DONE: 任务完成, 停发目标, 等待 offboard_control 自动 disarm
+        # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
         # ============================
         elif self.state == FlightState.DONE:
-            self.get_logger().info('[DONE] 任务完成, 关闭节点.')
-            # 同 competition_mission: shutdown 停掉本节点
-            # → /uav/target_position 停发 → offboard_control Z≈0 → land() → PX4 落地锁桨
-            rclpy.shutdown()
+            self.get_logger().info(
+                '[DONE] 持续发送 Z=0, 等待 PX4 落地锁桨...',
+                throttle_duration_sec=3.0)
+            # 持续发 Z=0: offboard_control tar_z≈0 → land() → 落地 → disarm
+            self.set_target_position(0.0, 0.0, 0.0)
 
 
 def main(args=None):
