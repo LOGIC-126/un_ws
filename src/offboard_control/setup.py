@@ -32,6 +32,7 @@ setup(
             'node_competition_mission = offboard_control.competition_mission:main',
             'node_test_pid = offboard_control.test_pid:main',
             'node_yolo_tracking = offboard_control.yolo_tracking:main',
+            'node_tf_tracking = offboard_control.tf_tracking:main',
         ],
     },
 )
