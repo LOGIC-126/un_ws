@@ -32,8 +32,8 @@
     pid.kd_yaw: 0.05
 
     # --- 速度限制 (追踪模式 — 保守) ---
-    pid.max_horizontal_speed: 0.3
-    pid.max_vertical_speed: 0.6
+    pid.max_horizontal_speed: 0.4
+    pid.max_vertical_speed: 0.5
     pid.max_yaw_rate: 0.5
 
     # --- 平滑滤波器 (追踪模式 — 降低加速度) ---
