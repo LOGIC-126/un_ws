@@ -20,8 +20,7 @@ from px4_msgs.msg import (
     VehicleLocalPosition,
     VehicleStatus,
     BatteryStatus,
-    VehicleLandDetected,
-    DistanceSensor
+    VehicleLandDetected
 )
 
 class Land_Control(Node):
@@ -97,9 +96,6 @@ class Land_Control(Node):
         self.vehicle_land_detected_subscriber = self.create_subscription(
             VehicleLandDetected, '/fmu/out/vehicle_land_detected',
             self.vehicle_land_detected_callback, qos_profile)
-        self.distance_sensor_subscriber = self.create_subscription(
-            DistanceSensor, '/fmu/out/distance_sensor',
-            self.distance_sensor_callback, qos_profile)
 
         self.target_position_subscriber = self.create_subscription(
             Pose, '/uav/target_position', self.target_position_callback, qos_profile)
@@ -168,35 +164,6 @@ class Land_Control(Node):
         self.ki_yaw = self.get_parameter('pid.ki_yaw').value
         self.kd_yaw = self.get_parameter('pid.kd_yaw').value
 
-        # ===================================================================
-        # DistBottom 异常检测参数 (策略B: raw laser + baro 双源)
-        # 飞控端需配合: EKF2_RNG_CTRL=0, EKF2_HGT_REF=0
-        # ===================================================================
-        self.declare_parameter('anomaly.enabled', True)
-        self.declare_parameter('anomaly.car_height_threshold', 0.3)
-        self.declare_parameter('anomaly.confirm_frames', 3)
-        self.declare_parameter('anomaly.recovery_frames', 5)
-        self.declare_parameter('anomaly.freeze_integral', True)
-
-        self.anomaly_enabled = self.get_parameter('anomaly.enabled').value
-        self.anomaly_car_height_threshold = self.get_parameter('anomaly.car_height_threshold').value
-        self.anomaly_confirm_frames = self.get_parameter('anomaly.confirm_frames').value
-        self.anomaly_recovery_frames = self.get_parameter('anomaly.recovery_frames').value
-        self.anomaly_freeze_integral = self.get_parameter('anomaly.freeze_integral').value
-
-        # ---- 异常检测器状态 (IMU速度预测+激光验证, 零baro) ----
-        self.raw_laser_distance = -1.0         # /fmu/out/distance_sensor 原始值
-        self.laser_distance_valid = False       # 激光数据是否有效
-        self.ref_ground_z = None               # NED 地面参考高度
-        self.ground_z_initialized = False       # 地面参考是否已初始化
-        self.anomaly_active = False             # 当前是否处于异常模式
-        self.anomaly_frame_count = 0            # 连续异常帧计数
-        self.normal_frame_count = 0             # 连续正常帧计数
-        self.prev_laser_distance = -1.0         # 上一帧激光距离 (IMU预测用)
-        self.filtered_laser_innovation = 0.0    # 激光innovation LPF值
-        self.frozen_integral_z = 0.0            # 异常时冻结的 Z 积分值
-        self.filtered_laser_height = None       # 激光推算高度低通滤波值
-
         # PID 内部状态
         self.integral_x = 0.0
         self.integral_y = 0.0
@@ -262,14 +229,6 @@ class Land_Control(Node):
         self.target_velocity.linear.z = vz
         self.target_velocity.angular.z = yr
         self.last_velocity_time = self.get_clock().now()
-
-    def distance_sensor_callback(self, msg: DistanceSensor) -> None:
-        """策略B: 接收原始激光测距值, 不与 PX4 EKF 融合."""
-        if msg.current_distance > 0.0:
-            self.raw_laser_distance = msg.current_distance
-            self.laser_distance_valid = True
-        else:
-            self.laser_distance_valid = False
 
     def arm(self):
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
@@ -341,131 +300,6 @@ class Land_Control(Node):
         self.vehicle_command_publisher.publish(msg)
 
     # ===================================================================
-    # DistBottom 异常检测器 (策略B: raw laser ↔ baro 双源)
-    # 借鉴 PX4 EKF2: innovation gate + kinematic consistency + rng_hgt=false mode
-    # ===================================================================
-
-    def _reset_anomaly_state(self) -> None:
-        """重置异常检测器状态机, 保留 ref_ground_z 地面参考."""
-        self.anomaly_active = False
-        self.anomaly_frame_count = 0
-        self.normal_frame_count = 0
-        self.frozen_integral_z = 0.0
-
-    def _detect_anomaly(self, laser_distance: float, dt: float) -> tuple:
-        """
-        IMU速度预测 + 激光验证 异常检测 (完全不依赖气压计).
-
-        核心: predicted_laser = prev_laser - vz_imu * dt
-              innovation = actual - predicted
-              地面平坦 → innovation≈0 (IMU预测与激光一致)
-              小车出现 → laser骤减, IMU没动 → 大负innovation → 检测!
-
-        返回: (is_anomaly: bool, effective_z: float, freeze_flag: bool)
-        """
-        if not self.anomaly_enabled:
-            return False, self.filtered_laser_height or 0.0, False
-
-        # ---- Step 0: 传感器有效性 ----
-        if not self.laser_distance_valid or laser_distance <= 0.0:
-            self._reset_anomaly_state()
-            return False, self.filtered_laser_height or 0.0, False
-
-        # ---- Step 1: 初始化地面参考 (仅一次, 用EKF z做绝对参考) ----
-        if not self.ground_z_initialized and laser_distance > 0.1:
-            ekf_z = self.vehicle_local_position.z
-            self.ref_ground_z = ekf_z + laser_distance
-            self.ground_z_initialized = True
-            self.prev_laser_distance = laser_distance
-            self.filtered_laser_height = ekf_z
-            self.filtered_laser_innovation = 0.0
-            self.get_logger().info(
-                f"[Anomaly] Ground init: ref_z={self.ref_ground_z:.3f} "
-                f"(z={ekf_z:.3f}, laser={laser_distance:.3f})"
-            )
-            return False, ekf_z, False
-
-        if not self.ground_z_initialized:
-            return False, 0.0, False
-
-        # ---- Step 2: IMU预测激光距离变化 ----
-        vz = self.vehicle_local_position.vz  # NED: 正=下降
-        if self.prev_laser_distance > 0:
-            predicted_laser = self.prev_laser_distance - vz * dt
-        else:
-            predicted_laser = laser_distance
-
-        # Innovation = 实际激光 - IMU预测 (零baro!)
-        laser_innovation = laser_distance - predicted_laser
-
-        # LPF平滑innovation (过滤激光50Hz逐帧噪声)
-        alpha_innov = 0.2
-        if not hasattr(self, 'filtered_laser_innovation'):
-            self.filtered_laser_innovation = 0.0
-        self.filtered_laser_innovation = (
-            (1.0 - alpha_innov) * self.filtered_laser_innovation
-            + alpha_innov * laser_innovation
-        )
-        self.prev_laser_distance = laser_distance
-
-        # ---- Step 3: 创新门限检测 (纯IMU, 零baro) ----
-        innovation_trigger = (
-            abs(self.filtered_laser_innovation) > self.anomaly_car_height_threshold
-        )
-
-        # ---- Step 4: 激光推算高度 (始终驱动PID) ----
-        laser_height_raw = self.ref_ground_z - laser_distance
-        alpha = 0.15  # ~3Hz @ 50Hz
-        if self.filtered_laser_height is None:
-            self.filtered_laser_height = laser_height_raw
-        else:
-            self.filtered_laser_height = (
-                (1.0 - alpha) * self.filtered_laser_height + alpha * laser_height_raw
-            )
-
-        # ---- Step 5: 状态机 ----
-        if innovation_trigger:
-            self.normal_frame_count = 0
-            self.anomaly_frame_count += 1
-            if self.anomaly_frame_count > self.anomaly_confirm_frames + 5:
-                self.anomaly_frame_count = self.anomaly_confirm_frames + 5
-
-            if not self.anomaly_active and \
-               self.anomaly_frame_count >= self.anomaly_confirm_frames:
-                self.anomaly_active = True
-                self.frozen_integral_z = self.integral_z
-                self.get_logger().warn(
-                    f"[Anomaly] CAR DETECTED! "
-                    f"laser_innov={self.filtered_laser_innovation:+.2f}m, "
-                    f"integral frozen. ref_ground_z adapting..."
-                )
-
-            # 用innovation直接更新ref_ground_z (零baro!)
-            # 小车出现→laser骤减→innovation<0→ref下移→激光高度保持正确
-            self.ref_ground_z += self.filtered_laser_innovation
-
-        else:
-            self.anomaly_frame_count = max(0, self.anomaly_frame_count - 1)
-
-            if self.anomaly_active:
-                self.normal_frame_count += 1
-                if self.normal_frame_count >= self.anomaly_recovery_frames:
-                    self.get_logger().info(
-                        f"[Anomaly] Recovered. ref_ground_z={self.ref_ground_z:.3f}"
-                    )
-                    self._reset_anomaly_state()
-                    return False, self.filtered_laser_height, False
-            else:
-                # 正常模式: innovation缓慢修正地面参考 (地形渐变, 零baro)
-                alpha_ground = 0.005
-                self.ref_ground_z += self.filtered_laser_innovation * alpha_ground
-
-        # ---- Step 6: 返回 (effective_z 始终为激光高度) ----
-        if self.anomaly_active:
-            return True, self.filtered_laser_height, self.anomaly_freeze_integral
-        return False, self.filtered_laser_height, False
-
-    # ===================================================================
     # PID 控制器与核心平滑滤波算法
     # ===================================================================
 
@@ -485,9 +319,6 @@ class Land_Control(Node):
         self.filtered_vy = self.vehicle_local_position.vy if hasattr(self.vehicle_local_position, 'vy') else 0.0
         self.filtered_vz = self.vehicle_local_position.vz if hasattr(self.vehicle_local_position, 'vz') else 0.0
         self.filtered_yawspeed = 0.0
-
-        # 同步重置异常检测器
-        self._reset_anomaly_state()
 
     @staticmethod
     def _yaw_error_wrap(target: float, current: float) -> float:
@@ -591,14 +422,11 @@ class Land_Control(Node):
 
         mode_label = 'Vel-PID' if self.control_mode == 'velocity_pid' else 'Pos'
         cmd_label = 'DirectVel' if velocity_active else mode_label
-        anomaly_label = '🟡ANOM' if self.anomaly_active else '🟢OK'
         self.get_logger().info(
             f"--- UAV STATUS --- "
             f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
-            f"Laser: {self.raw_laser_distance:.2f}m | "
             f"Nav: {self.vehicle_status.nav_state} | "
-            f"Ctrl: {cmd_label} | "
-            f"{anomaly_label}"
+            f"Ctrl: {cmd_label}"
         )
 
         if self.offboard_setpoint_counter < 10:
@@ -635,7 +463,6 @@ class Land_Control(Node):
             self.arm_time = None  # offboard 已建立，清除计时
             if abs(tar_z) < 0.05:
                 self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
-                self._reset_anomaly_state()
                 self.land()
             else:
                 # —— 核心控制分发 ——
@@ -644,10 +471,6 @@ class Land_Control(Node):
                     if not self.was_velocity_active:
                         self._reset_pid()
                         self.was_velocity_active = True
-
-                    # 维持 anomaly detector 状态跟踪 (PID 不启用时仍更新)
-                    if self.anomaly_enabled:
-                        self._detect_anomaly(self.raw_laser_distance, dt)
 
                     raw_vx = self.target_velocity.linear.x
                     raw_vy = self.target_velocity.linear.y
@@ -662,34 +485,16 @@ class Land_Control(Node):
                     curr_z = self.vehicle_local_position.z
                     curr_yaw = self.vehicle_local_position.heading
 
-                    # === 异常检测 (IMU速度预测+激光验证, 零baro) ===
-                    is_anomaly, effective_z, freeze_flag = self._detect_anomaly(
-                        self.raw_laser_distance, dt
-                    )
-
-                    if is_anomaly:
-                        self.get_logger().info(
-                            f"[ANOMALY] laser_height={effective_z:.3f} "
-                            f"(ref_ground_z={self.ref_ground_z:.3f}, "
-                            f"laser_dist={self.raw_laser_distance:.3f}m)",
-                            throttle_duration_sec=0.5
-                        )
-                    # =====================================================
-
                     tar_x = self.target_pose.position.x
                     tar_y = self.target_pose.position.y
                     tar_yaw = self.quaternion_to_yaw(self.target_pose.orientation)
                     self.target_yaw = tar_yaw
 
-                    # 原始突变/带噪 PID 期望输出
+                    # PID: Z轴直接使用EKF融合高度(ekf2_link_dds以vision方式提供激光定高)
                     raw_vx = self._pid_step('x', tar_x, curr_x, dt)
                     raw_vy = self._pid_step('y', tar_y, curr_y, dt)
-                    raw_vz = self._pid_step('z', tar_z, effective_z, dt)
+                    raw_vz = self._pid_step('z', tar_z, curr_z, dt)
                     raw_yr = self._pid_step('yaw', tar_yaw, curr_yaw, dt)
-
-                    # 异常时冻结 Z 积分防止 windup
-                    if freeze_flag:
-                        self.integral_z = self.frozen_integral_z
 
                 # ===========================================================
                 # 【拦截点】不管哪种速度源，发送前均进行物理平滑与滤波处理

@@ -45,10 +45,5 @@
     filter.max_accel_vertical: 4.0
     filter.max_accel_yaw: 1.5
 
-    # --- DistBottom 异常检测 (抗小车高度干扰, IMU预测+激光验证, 零baro) ---
-    # 飞控端需配合设置: EKF2_RNG_CTRL=0 (禁用EKF激光融合)
-    anomaly.enabled: true                   # 总开关: 是否启用异常检测
-    anomaly.car_height_threshold: 0.2       # 激光innovation阈值(m), 需<车高(~30cm)确保触发
-    anomaly.confirm_frames: 3               # 连续异常帧数确认 (50Hz时=60ms防抖)
-    anomaly.recovery_frames: 5              # 连续正常帧数恢复 (50Hz时=100ms消抖)
-    anomaly.freeze_integral: true           # 异常期间冻结Z轴积分, 防止windup
+    # 高度由 ekf2_link_dds 以 vision 方式提供给 PX4 EKF, 飞控端配合:
+    #   EKF2_RNG_CTRL=0, EKF2_HGT_REF=3 (vision height source)
