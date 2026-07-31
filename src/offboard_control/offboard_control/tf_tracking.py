@@ -511,7 +511,7 @@ class TFTrackingNode(Node):
             self.set_target_position(0.0, 0.0, self.takeoff_height)
 
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停5s)")
+                self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
                 self._record_hover_position()
                 self._reset_tracking_counters()
                 self._locked_target = None
@@ -527,9 +527,9 @@ class TFTrackingNode(Node):
             # 悬停5秒后再开始检测
             if self._wait_start_time is not None:
                 hover_elapsed = (self.get_clock().now() - self._wait_start_time).nanoseconds * 1e-9
-                if hover_elapsed < 5.0:
+                if hover_elapsed < 2.0:
                     self.get_logger().info(
-                        f'[WAIT] 悬停等待 {hover_elapsed:.1f}s/5.0s...',
+                        f'[WAIT] 悬停等待 {hover_elapsed:.1f}s/2.0s...',
                         throttle_duration_sec=1.0)
                     return
                 else:
