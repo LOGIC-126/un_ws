@@ -497,9 +497,6 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             self.arm_time = None  # 未解锁，清除计时
-            # Z≈0 表示已完成着陆, 禁止再次起飞
-            if abs(tar_z) < 0.05:
-                self.has_target_altitude = False
             if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self._reset_pid()
@@ -582,7 +579,6 @@ class Land_Control(Node):
                 self._reset_pid()
                 self.disarm()
                 self.arm_time = None
-                self.has_target_altitude = False  # 落地后禁止再次自动起飞
 
     def _timer_position_mode(self, is_landed: bool, is_armed: bool,
                              in_offboard: bool, velocity_active: bool):
@@ -618,9 +614,6 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             self.arm_time = None  # 未解锁，清除计时
-            # Z≈0 表示已完成着陆, 禁止再次起飞
-            if abs(tar_z) < 0.05:
-                self.has_target_altitude = False
             if self.has_target_altitude and abs(tar_z) > 0.1:
                 self.get_logger().info("Ground & Disarmed. Valid altitude → Auto-Takeoff...")
                 self.engage_offboard_mode()
