@@ -52,14 +52,9 @@ class Ekf2LinkDDS(Node):
         self.car_offset_x = self.get_parameter('car.offset_x').value
         self.car_offset_y = self.get_parameter('car.offset_y').value
 
-        # ---- TF 监听器 (多话题: /tf + /car/tf, 解决命名空间隔离) ----
+        # ---- TF 监听器 ----
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        from tf2_msgs.msg import TFMessage
-        for topic in ('/car/tf', '/car/tf_static'):
-            self.create_subscription(TFMessage, topic,
-                lambda msg: [self.tf_buffer.set_transform(t, 'default_authority') for t in msg.transforms],
-                100)
 
         # ---- QoS (匹配PX4 BEST_EFFORT) ----
         self.qos_profile = QoSProfile(
