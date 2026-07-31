@@ -19,15 +19,17 @@ echo "等待节点初始化..."
 sleep 15
 
 echo "start ekf2_link_dds"
-ros2 run ekf2_trans node_ekf2_link_dds
+ros2 run ekf2_trans node_ekf2_link_dds &
 sleep 5
 
-ros2 run offboard_control node_offboard_control --ros-args --params-file install/offboard_control/share/offboard_control/config/tracking_params.yaml
+echo "start node_offboard_control"
+ros2 run offboard_control node_offboard_control --ros-args --params-file install/offboard_control/share/offboard_control/config/tracking_params.yaml &
 sleep 5
 
-
-ros2 run offboard_control node_tf_tracking --ros-args     -p car.offset_x:=0.52     -p car.offset_y:=-0.30
+echo "start node_tf_tracking"
+ros2 run offboard_control node_tf_tracking --ros-args     -p car.offset_x:=0.52     -p car.offset_y:=-0.30 &
 sleep 5
 
-# 当cartographer退出时，杀死所有后台作业
+# 等待任意后台进程退出，然后清理所有
+wait
 kill $(jobs -p) 2>/dev/null
