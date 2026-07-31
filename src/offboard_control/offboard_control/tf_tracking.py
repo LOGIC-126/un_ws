@@ -35,6 +35,7 @@ from enum import Enum
 
 import tf2_ros
 from tf2_ros import TransformException
+from tf2_msgs.msg import TFMessage
 import tf_transformations
 
 from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
@@ -68,7 +69,7 @@ class TFTrackingNode(Node):
         # —— TF 帧配置 ——
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('drone_frame', 'base_link')
-        self.declare_parameter('car_frame', 'car_base_link')  # 小车 TF frame
+        self.declare_parameter('car_frame', 'base_footprint')  # 小车 frame (通常 base_footprint)
 
         # —— 追踪参数 ——
         self.declare_parameter('max_distance', 15.0)
@@ -96,9 +97,15 @@ class TFTrackingNode(Node):
         self.vision_match_threshold = self.get_parameter('vision_match_threshold').value
         self.fence_radius = self.get_parameter('fence_radius').value
 
-        # ====== TF2 监听器 (参考 ekf2_link_dds.py:56-57) ======
+        # ====== TF2 监听器 (多话题: /tf + /car/tf, 参考 waypoint_tracker) ======
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # 手动订阅所有 TF 源，统一塞进 Buffer
+        for topic in ('/tf', '/tf_static', '/car/tf', '/car/tf_static'):
+            self.create_subscription(
+                TFMessage, topic,
+                lambda msg: [self.tf_buffer.set_transform(t, 'default_authority')
+                             for t in msg.transforms],
+                100)
 
         # ====== QoS ======
         qos_profile = QoSProfile(
