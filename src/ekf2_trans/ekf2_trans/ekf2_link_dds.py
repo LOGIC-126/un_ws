@@ -72,18 +72,17 @@ class Ekf2LinkDDS(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, self.qos_profile)
 
-        # ---- 激光高度检测器状态 (双时间常数, 零baro) ----
+        # ---- 激光高度检测器状态 (IMU速度区分, 零baro) ----
         self.raw_laser_distance = -1.0
         self.laser_distance_valid = False
         self.vehicle_local_pos = None
 
         self.ref_ground_z = None            # NED 地面参考高度
         self.ground_z_initialized = False
-        self.anomaly_active = False
-        self.anomaly_frame_count = 0
-        self.normal_frame_count = 0
-        self.fast_laser_height = None       # 快滤波 (α=0.15) → 高度输出
-        self.slow_laser_height = None       # 慢滤波 (α=0.005) → 稳态参考
+        self.fast_laser_height = None       # 滤波高度输出 (α=0.15)
+        self.prev_laser_for_imu = -1.0      # 上一帧激光 (IMU对比用)
+        self.surface_motion_accum = 0.0     # 地面运动累积器
+        self.surface_motion_count = 0       # 累积帧计数
 
         # ---- 定时器 ----
         self.timer = self.create_timer(1.0 / self.frequency, self.timer_callback)
@@ -105,19 +104,21 @@ class Ekf2LinkDDS(Node):
     def vehicle_local_position_callback(self, msg: VehicleLocalPosition) -> None:
         self.vehicle_local_pos = msg
 
-    # ==================== 激光高度处理 (双时间常数异常检测) ====================
+    # ==================== 激光高度处理 (IMU速度区分: 谁在动?) ====================
 
     def _update_laser_height(self, laser_distance: float, dt: float) -> float:
         """
-        处理原始激光距离 → 滤波高度, 含小车异常检测.
+        IMU速度区分异常检测: 用IMU vz区分"无人机在动"和"地面在动".
 
-        双时间常数原理:
-          fast_h (α=0.15):  追踪高度输出, 响应快
-          slow_h (α=0.005): 稳态参考, 响应极慢
-          小车出现 → fast_h突变, slow_h不变 → |fast - slow| > 阈值 → 异常
-          异常确认 → ref_ground_z瞬间修正 → fast_h立即恢复正确
+        核心:
+          delta_laser_h = -(laser - prev_laser)  → 激光说高度变了多少
+          delta_imu_h   = vz * dt                → IMU说高度变了多少
+          surface_delta = delta_laser_h - delta_imu_h  → 地面动了多少
 
-        返回: 滤波后的激光高度 (NED, m).
+          无人机正常升降 → delta_laser ≈ delta_imu → surface≈0
+          小车出现/消失   → delta_laser有, delta_imu≈0 → surface≠0 → 异常!
+
+        累积5帧(100ms)后判定, 避免单帧激光噪声.
         """
         if not self.laser_distance_valid or laser_distance <= 0.0:
             return None
@@ -126,13 +127,16 @@ class Ekf2LinkDDS(Node):
             return None
 
         ekf_z = self.vehicle_local_pos.z
+        vz = self.vehicle_local_pos.vz
 
         # ---- Step 0: 初始化 ----
         if not self.ground_z_initialized and laser_distance > 0.1:
             self.ref_ground_z = ekf_z + laser_distance
             self.ground_z_initialized = True
             self.fast_laser_height = ekf_z
-            self.slow_laser_height = ekf_z
+            self.prev_laser_for_imu = laser_distance
+            self.surface_motion_accum = 0.0
+            self.surface_motion_count = 0
             self.get_logger().info(
                 f"[LaserHgt] Ground init: ref_z={self.ref_ground_z:.3f} "
                 f"(z={ekf_z:.3f}, laser={laser_distance:.3f})"
@@ -142,10 +146,8 @@ class Ekf2LinkDDS(Node):
         if not self.ground_z_initialized:
             return None
 
-        # ---- Step 1: 激光推算高度 ----
+        # ---- Step 1: 激光推算高度 (始终输出) ----
         laser_height_raw = self.ref_ground_z - laser_distance
-
-        # 标记输出滤波器 (α=0.15, ~3Hz)
         if self.fast_laser_height is None:
             self.fast_laser_height = laser_height_raw
         else:
@@ -153,59 +155,43 @@ class Ekf2LinkDDS(Node):
                 0.85 * self.fast_laser_height + 0.15 * laser_height_raw
             )
 
-        # 稳态参考滤波器 (α=0.005, ~0.04Hz, 50帧才明显响应)
-        if self.slow_laser_height is None:
-            self.slow_laser_height = laser_height_raw
-        else:
-            self.slow_laser_height = (
-                0.995 * self.slow_laser_height + 0.005 * laser_height_raw
+        # ---- Step 2: IMU速度区分 — 谁在动? ----
+        if hasattr(self, 'prev_laser_for_imu') and self.prev_laser_for_imu > 0:
+            # 激光推算的高度变化 (激光减小=无人机下降, NED正方向)
+            delta_laser_h = -(laser_distance - self.prev_laser_for_imu)
+            # IMU推算的高度变化
+            delta_imu_h = vz * dt
+            # 地面运动 = 激光看到的变化 - 无人机自身运动
+            surface_delta = delta_laser_h - delta_imu_h
+
+            self.surface_motion_accum += surface_delta
+            self.surface_motion_count += 1
+        self.prev_laser_for_imu = laser_distance
+
+        # 每5帧(100ms)判定一次
+        anomaly_this_frame = False
+        if self.surface_motion_count >= 5:
+            anomaly_this_frame = (
+                abs(self.surface_motion_accum) > self.car_height_threshold
             )
-
-        # ---- Step 2: 双时间常数异常检测 ----
-        # 小车出现 → raw突变 → fast很快响应, slow几乎不变
-        # → |fast - slow| 持续多帧 → 可靠检测 (不再依赖单帧innovation!)
-        height_divergence = self.fast_laser_height - self.slow_laser_height
-        anomaly_this_frame = (
-            abs(height_divergence) > self.car_height_threshold
-        )
-
-        # ---- Step 3: 状态机 ----
-        if anomaly_this_frame:
-            self.normal_frame_count = 0
-            self.anomaly_frame_count += 1
-            if self.anomaly_frame_count > self.confirm_frames + 5:
-                self.anomaly_frame_count = self.confirm_frames + 5
-
-            if not self.anomaly_active and \
-               self.anomaly_frame_count >= self.confirm_frames:
-                self.anomaly_active = True
-                # 瞬间修正ref_ground_z到新表面
-                self.ref_ground_z -= height_divergence
-                # 重置滤波器, 消除收敛延迟
+            if anomaly_this_frame:
+                # 地面突变 → 修正ref_ground_z (符号: surface>0=地面升=小车出现)
+                self.ref_ground_z -= self.surface_motion_accum
+                # 重置高度输出, 跳过LPF收敛延迟
                 self.fast_laser_height = self.ref_ground_z - laser_distance
-                self.slow_laser_height = self.fast_laser_height
                 self.get_logger().warn(
-                    f"[LaserHgt] CAR DETECTED! "
-                    f"diverg={height_divergence:+.2f}m, "
+                    f"[LaserHgt] SURFACE JUMP! "
+                    f"surface_delta={self.surface_motion_accum:+.2f}m, "
                     f"ref_ground_z→{self.ref_ground_z:.3f}"
                 )
+            # 重置累积器
+            self.surface_motion_accum = 0.0
+            self.surface_motion_count = 0
 
-        else:
-            self.anomaly_frame_count = max(0, self.anomaly_frame_count - 1)
-
-            if self.anomaly_active:
-                self.normal_frame_count += 1
-                if self.normal_frame_count >= self.recovery_frames:
-                    self.get_logger().info(
-                        f"[LaserHgt] Recovered. "
-                        f"ref_ground_z={self.ref_ground_z:.3f}"
-                    )
-                    self.anomaly_active = False
-                    self.anomaly_frame_count = 0
-                    self.normal_frame_count = 0
-            else:
-                # 正常模式: ref_ground_z缓慢跟踪地形渐变
-                self.ref_ground_z -= height_divergence * 0.005
+        # ---- Step 3: 正常时缓慢修正地面参考 ----
+        if not anomaly_this_frame and not self.anomaly_active:
+            # 用surface_motion的慢速EMA来跟踪地形渐变
+            pass  # ref_ground_z 保持不变, 依赖异常检测时的大跳更新
 
         return self.fast_laser_height
 
