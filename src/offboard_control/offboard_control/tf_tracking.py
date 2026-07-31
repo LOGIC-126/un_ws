@@ -21,10 +21,7 @@ TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监�
 
 可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST
-  - aux1 (通道9) 上升沿: 触发起飞
-  - aux1 HIGH: 允许追踪 (WAIT→TRACK 自动)
-  - aux1 LOW:  禁用追踪 (TRACK/LOST→WAIT)
+状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST (全自动, 无需RC)
 """
 
 import math
@@ -38,7 +35,7 @@ from tf2_ros import TransformException
 from tf2_msgs.msg import TFMessage
 import tf_transformations
 
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus, ManualControlSetpoint
+from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
 from std_msgs.msg import Int32
 from geometry_msgs.msg import Pose, PoseArray
 
@@ -64,8 +61,6 @@ class TFTrackingNode(Node):
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('lost_timeout', 2.0)
         self.declare_parameter('search_timeout', 10.0)
-        self.declare_parameter('rc_trigger_aux', 'aux1')
-        self.declare_parameter('rc_trigger_threshold', 0.5)
 
         # —— TF 帧配置 ——
         self.declare_parameter('map_frame', 'map')
@@ -133,9 +128,6 @@ class TFTrackingNode(Node):
         self.vehicle_status_sub = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v2',
             self.vehicle_status_callback, qos_profile)
-        self.manual_control_sub = self.create_subscription(
-            ManualControlSetpoint, '/fmu/out/manual_control_setpoint',
-            self.manual_control_callback, qos_profile)
 
         # —— YOLO 视觉检测 (可选, 融合模式) ——
         if self.enable_vision_fusion:
@@ -145,7 +137,7 @@ class TFTrackingNode(Node):
         else:
             self.world_coords_sub = None
 
-        # —— 小车启动触发 (替代 RC 上升沿) ——
+        # —— 小车启动触发 (waypoint_tracker 行驶≥0.5m 后发布) ——
         self._car_triggered = False
         self.car_trigger_sub = self.create_subscription(
             Int32, '/car/trigger', self._car_trigger_callback, 10)
@@ -155,12 +147,6 @@ class TFTrackingNode(Node):
         self.vehicle_local_position = VehicleLocalPosition()
 
         self.state = FlightState.INIT
-
-        # RC 持续监控
-        self._last_rc_raw = False
-        self._rc_level = False
-        self._rc_rising_edge = False
-        self._rc_falling_edge = False
 
         # 小车位姿缓存 (无人机 NED 坐标系)
         self._car_ned = None             # (ned_x, ned_y) or None
@@ -205,23 +191,6 @@ class TFTrackingNode(Node):
 
     def vehicle_status_callback(self, msg: VehicleStatus) -> None:
         self.vehicle_status = msg
-
-    def manual_control_callback(self, msg: ManualControlSetpoint) -> None:
-        if not msg.valid:
-            return
-        aux_name = self.get_parameter('rc_trigger_aux').value
-        val = getattr(msg, aux_name, 0.0)
-        current_raw = (val > self.get_parameter('rc_trigger_threshold').value)
-
-        if current_raw and not self._last_rc_raw:
-            self._rc_rising_edge = True
-            self.get_logger().info(f"RC 上升沿 ({aux_name}={val:.2f})")
-        if not current_raw and self._last_rc_raw:
-            self._rc_falling_edge = True
-            self.get_logger().info(f"RC 下降沿 ({aux_name}={val:.2f})")
-
-        self._last_rc_raw = current_raw
-        self._rc_level = current_raw
 
     def _car_trigger_callback(self, msg: Int32) -> None:
         """接收小车 waypoint_tracker 的启动信号 (行驶≥0.5m 后触发)"""
@@ -414,14 +383,9 @@ class TFTrackingNode(Node):
                 self.state = FlightState.INIT
                 self._reset_tracking_counters()
                 self._locked_target = None
-                self._rc_rising_edge = False
-                self._rc_falling_edge = False
                 return
 
         self.run_state_machine()
-
-        self._rc_rising_edge = False
-        self._rc_falling_edge = False
 
         # 状态显示 (每2秒)
         self._print_status()
@@ -449,15 +413,14 @@ class TFTrackingNode(Node):
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
                 f"小车 NED({car[0]:.2f}, {car[1]:.2f}) | "
                 f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
-                f"距离={dist:.2f}m | rc={self._rc_level}"
+                f"距离={dist:.2f}m"
             )
         else:
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
                 f"小车: 未检测到 | "
-                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
-                f"rc={self._rc_level}"
+                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f})"
             )
 
     def run_state_machine(self) -> None:
@@ -491,7 +454,7 @@ class TFTrackingNode(Node):
                 self.state = FlightState.WAIT
 
         # ============================
-        # WAIT: 悬停, 等待小车信号 + aux1=HIGH
+        # WAIT: 悬停, 检测到小车即自动追踪
         # ============================
         elif self.state == FlightState.WAIT:
             self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
@@ -502,7 +465,7 @@ class TFTrackingNode(Node):
             else:
                 self._car_detection_count = 0
 
-            if self._rc_level and self._car_detection_count >= self.confirm_frames:
+            if self._car_detection_count >= self.confirm_frames:
                 target = self._get_target_ned()
                 if target is not None:
                     ned_x, ned_y, dist = target
@@ -518,14 +481,6 @@ class TFTrackingNode(Node):
         # TRACK: 追踪小车
         # ============================
         elif self.state == FlightState.TRACK:
-            if self._rc_falling_edge:
-                self.get_logger().info("TRACK → WAIT (aux1 ↓)")
-                self._record_hover_position()
-                self._reset_tracking_counters()
-                self._locked_target = None
-                self.state = FlightState.WAIT
-                return
-
             target = self._get_target_ned()
 
             if target is not None:
@@ -562,14 +517,6 @@ class TFTrackingNode(Node):
         # LOST: 最后位置搜索
         # ============================
         elif self.state == FlightState.LOST:
-            if self._rc_falling_edge:
-                self.get_logger().info("LOST → WAIT (aux1 ↓)")
-                self._record_hover_position()
-                self._reset_tracking_counters()
-                self._locked_target = None
-                self.state = FlightState.WAIT
-                return
-
             if self._locked_target is not None:
                 lx, ly = self._locked_target
                 self.set_target_position(lx, ly, self.takeoff_height)
