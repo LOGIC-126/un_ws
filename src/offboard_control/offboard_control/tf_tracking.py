@@ -235,7 +235,11 @@ class TFTrackingNode(Node):
             car_map_x = car_tf.transform.translation.x
             car_map_y = car_tf.transform.translation.y
 
-        except TransformException:
+        except TransformException as e:
+            self.get_logger().warn(
+                f"TF查询失败 ({self.map_frame}→{self.drone_frame} 或 "
+                f"{self.map_frame}→{self.car_frame}): {e}",
+                throttle_duration_sec=3.0)
             return None
 
         # 3. 相对偏移 (ROS FLU: x=北, y=西)
@@ -390,6 +394,43 @@ class TFTrackingNode(Node):
 
         self._rc_rising_edge = False
         self._rc_falling_edge = False
+
+        # 状态显示 (每2秒)
+        self._print_status()
+
+    def _print_status(self) -> None:
+        """每2秒打印追踪状态"""
+        now = self.get_clock().now()
+        if not hasattr(self, '_last_log_time'):
+            self._last_log_time = now
+            return
+        if (now - self._last_log_time).nanoseconds * 1e-9 < 2.0:
+            return
+        self._last_log_time = now
+
+        drone = self.vehicle_local_position
+        state_name = self.state.name
+        car = self._lookup_car_ned()  # 不阻塞, 快速查询
+
+        if car is not None:
+            dx = car[0] - drone.x
+            dy = car[1] - drone.y
+            dist = math.hypot(dx, dy)
+            self.get_logger().info(
+                f"[{state_name}] "
+                f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
+                f"小车 NED({car[0]:.2f}, {car[1]:.2f}) | "
+                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
+                f"距离={dist:.2f}m | rc={self._rc_level}"
+            )
+        else:
+            self.get_logger().info(
+                f"[{state_name}] "
+                f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
+                f"小车: 未检测到 | "
+                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
+                f"rc={self._rc_level}"
+            )
 
     def run_state_machine(self) -> None:
         # ============================
