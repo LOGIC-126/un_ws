@@ -83,6 +83,7 @@ class Ekf2LinkDDS(Node):
         self.car_y = 0.0
         self.car_position_valid = False
         self.car_comp_active = False     # 当前是否在补偿区内
+        self.filtered_car_comp = 0.0    # 补偿量LPF值 (平滑过渡, 防抽搐)
 
         # ---- 激光高度状态 ----
         self.raw_laser_distance = -1.0
@@ -210,10 +211,15 @@ class Ekf2LinkDDS(Node):
                         f"    exit car zone, dist={dist:.2f}m"
                     )
 
-                if in_zone:
-                    comp_z = laser_z - self.car_comp_height
+                # LPF平滑补偿量, 防硬切换抽搐 (~0.5s过渡)
+                target_comp = self.car_comp_height if in_zone else 0.0
+                self.filtered_car_comp = (
+                    0.9 * self.filtered_car_comp + 0.1 * target_comp
+                )
+                if self.filtered_car_comp > 0.01:
+                    comp_z = laser_z - self.filtered_car_comp
                     self.get_logger().info(
-                        f"[Comp] dist={dist:.2f}m → z={comp_z:.3f}",
+                        f"[Comp] d={dist:.2f}m comp={self.filtered_car_comp:.2f}m → z={comp_z:.3f}",
                         throttle_duration_sec=1.0
                     )
 
