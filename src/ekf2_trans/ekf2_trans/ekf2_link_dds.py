@@ -94,11 +94,16 @@ class Ekf2LinkDDS(Node):
         # ---- 定时器 ----
         self.timer = self.create_timer(1.0 / self.frequency, self.timer_callback)
 
-        self.get_logger().info(
-            f"DDS视觉里程计启动 "
-            f"(laser={'ON' if self.use_laser_height else 'OFF'}, "
-            f"car_comp={'ON' if self.use_car_comp else 'OFF'})"
-        )
+        self.get_logger().info("=" * 55)
+        self.get_logger().info("  DDS 视觉里程计 + 激光高度源")
+        self.get_logger().info(f"  laser_height: {'ON' if self.use_laser_height else 'OFF'}")
+        if self.use_car_comp:
+            self.get_logger().info("  ★ CAR COMPENSATION MODE ★")
+            self.get_logger().info(f"    dist<{self.car_comp_dist}m → height-{self.car_comp_height}m")
+            self.get_logger().info(f"    odom→map offset: x={self.car_offset_x}, y={self.car_offset_y}")
+        else:
+            self.get_logger().info("  car_compensation: OFF")
+        self.get_logger().info("=" * 55)
 
     # ==================== 回调 ====================
 
