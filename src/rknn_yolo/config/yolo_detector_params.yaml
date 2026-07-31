@@ -14,9 +14,9 @@
 /**:
   ros__parameters:
     # --- 模型 ---
-    rknn_model: "/home/orangepi/rknn_linker/carv8.rknn"
+    rknn_model: "/home/orangepi/rknn_linker/signv82.rknn"
     img_size: 640
-    classes: ["car"]
+    classes: ["sign"]
     reg_max: 16
     strides: [8, 16, 32]
 
@@ -25,7 +25,7 @@
     nms_thresh: 0.45
 
     # --- 输入源 ---
-    use_camera: false                 # true: 硬件摄像头, false: 订阅话题
+    use_camera: true                 # true: 硬件摄像头, false: 订阅话题
     image_topic: "/camera/color/image_raw"
     camera_device: "/dev/v4l/by-id/usb-HJ_USB_2.0_Camera_HJ_USB_2.0_Camera_SN0001-video-index0"
     camera_width: 640
