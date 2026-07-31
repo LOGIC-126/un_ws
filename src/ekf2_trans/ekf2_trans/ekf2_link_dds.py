@@ -32,12 +32,10 @@ class Ekf2LinkDDS(Node):
         self.declare_parameter('target_frame', 'base_link')
         self.declare_parameter('source_frame', 'map')
         self.declare_parameter('publish_frequency', 50.0)
-        self.declare_parameter('fixed_z', 0.0)
 
         self.target_frame = self.get_parameter('target_frame').value
         self.source_frame = self.get_parameter('source_frame').value
         self.frequency = self.get_parameter('publish_frequency').value
-        self.fixed_z = self.get_parameter('fixed_z').value
 
         # ---- 激光高度参数 ----
         self.declare_parameter('use_laser_height', True)
@@ -93,8 +91,7 @@ class Ekf2LinkDDS(Node):
 
         self.get_logger().info(
             "DDS视觉里程计节点启动 "
-            f"(laser_height={'ON' if self.use_laser_height else 'OFF'}, "
-            f"fixed_z={self.fixed_z})"
+            f"(laser_height={'ON' if self.use_laser_height else 'OFF'})"
         )
 
     # ==================== 订阅回调 ====================
@@ -244,36 +241,37 @@ class Ekf2LinkDDS(Node):
             odom_msg.timestamp_sample = odom_msg.timestamp
             odom_msg.pose_frame = VehicleOdometry.POSE_FRAME_NED
 
-            # XY from SLAM, Z from laser (or fixed_z fallback)
-            px4_z = laser_z if (laser_z is not None) else -self.fixed_z
-            odom_msg.position = [t.x, -t.y, px4_z]
+            # XYZ 3D定位: X/Y来自SLAM, Z来自激光(未就绪时NaN)
+            # PX4 EKF: innovation gate用 position_variance 过滤异常
+            odom_msg.position = [
+                t.x, -t.y,
+                laser_z if (laser_z is not None) else float('nan')
+            ]
 
-            # Yaw
+            # Yaw from SLAM
             px4_yaw = -yaw_ros
             q_ned = tf_transformations.quaternion_from_euler(0.0, 0.0, px4_yaw)
             odom_msg.q = [q_ned[3], q_ned[0], q_ned[1], q_ned[2]]
 
-            # 协方差: XY 2cm, Z 激光模式5cm / fixed模式10cm
-            z_var = 0.0025 if (laser_z is not None) else 0.01
-            odom_msg.position_variance = [0.0004, 0.0004, z_var]
+            # 协方差: XY=2cm, Z=10cm (激光精度, EKF可平滑融合)
+            # 飞控需设: EKF2_AID_MASK bit3=vision_pos  EKF2_HGT_REF=3
+            odom_msg.position_variance = [0.0004, 0.0004, 0.01]
             odom_msg.orientation_variance = [0.01, 0.01, 0.0004]
-
-            # 速度标记为无效 (不融合vision速度)
             odom_msg.velocity = [float('nan')] * 3
 
             self.odom_pub.publish(odom_msg)
 
         except TransformException:
-            # TF丢失时仍发布高度 (如果可用)
+            # TF丢失时仍发布激光高度
             if laser_z is not None:
                 odom_msg = VehicleOdometry()
                 odom_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
                 odom_msg.timestamp_sample = odom_msg.timestamp
                 odom_msg.pose_frame = VehicleOdometry.POSE_FRAME_NED
                 odom_msg.position = [float('nan'), float('nan'), laser_z]
-                odom_msg.position_variance = [1e6, 1e6, 0.0025]
+                odom_msg.position_variance = [1e6, 1e6, 0.01]
                 odom_msg.orientation_variance = [1e6, 1e6, 1e6]
-                odom_msg.q = [1.0, 0.0, 0.0, 0.0]  # identity
+                odom_msg.q = [1.0, 0.0, 0.0, 0.0]
                 odom_msg.velocity = [float('nan')] * 3
                 self.odom_pub.publish(odom_msg)
 
