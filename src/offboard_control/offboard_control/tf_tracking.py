@@ -184,9 +184,9 @@ class TFTrackingNode(Node):
         # 抛投计时
         self._drop_start_time = None
         self._drop_enter_time = None   # 进入DROP状态的时刻
+        self._drop_servo_done = False  # 抛投舵机动作只执行一次
         self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
         self._disarm_sent = False      # disarm 只发一次
-        self._servo_swept = False      # 启动舵机自检只做一次
 
         # —— 舵机串口 (抛投机构) ——
         self.servo_serial = None
@@ -245,16 +245,15 @@ class TFTrackingNode(Node):
         except serial.SerialException as e:
             self.get_logger().warn(f'舵机发送失败: {e}')
 
-    def _servo_sweep(self):
-        """上电自检: 正向+60° → 反向-60° → 回中"""
-        import time as _time
-        self.get_logger().info('舵机自检: 正向+60°')
+    def _servo_drop(self):
+        """抛投动作: 正向+60° → 反向-60° 抽拉来回"""
+        self.get_logger().info('抛投: 正向+60°')
         self._servo_cmd(bytes([0xA5, 0x01, 0xA6]))
-        _time.sleep(0.5)
-        self.get_logger().info('舵机自检: 反向-60°')
+        time.sleep(0.5)
+        self.get_logger().info('抛投: 反向-60°')
         self._servo_cmd(bytes([0xA5, 0x02, 0xA7]))
-        _time.sleep(0.5)
-        self.get_logger().info('舵机自检完成')
+        time.sleep(0.5)
+        self.get_logger().info('抛投抽拉完成')
 
     # ==================== TF 查询 (参考 ekf2_link_dds.py:176-181) ====================
 
@@ -490,11 +489,6 @@ class TFTrackingNode(Node):
         # INIT: 地面等待小车 /car/trigger 启动信号
         # ============================
         if self.state == FlightState.INIT:
-            # 首次进入 INIT → 舵机上电自检 (来回活动一次)
-            if not self._servo_swept:
-                self._servo_swept = True
-                self._servo_sweep()
-
             self.set_target_position(0.0, 0.0, 0.0)
 
             if self._car_triggered:
@@ -641,6 +635,12 @@ class TFTrackingNode(Node):
             # 计时
             if self._drop_enter_time is None:
                 self._drop_enter_time = self.get_clock().now()
+
+            # 首次进入 → 执行舵机抛投抽拉
+            if not self._drop_servo_done:
+                self._drop_servo_done = True
+                self._servo_drop()
+
             elapsed = (self.get_clock().now() - self._drop_enter_time).nanoseconds * 1e-9
 
             # 超时 → 返航
