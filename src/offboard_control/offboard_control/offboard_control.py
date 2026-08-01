@@ -509,7 +509,7 @@ class Land_Control(Node):
 
         elif in_offboard:
             self.arm_time = None  # offboard 已建立，清除计时
-            if abs(tar_z) < 0.05:
+            if abs(tar_z) < 0.01:
                 self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:
@@ -622,7 +622,7 @@ class Land_Control(Node):
 
         elif in_offboard:
             self.arm_time = None  # offboard 已建立，清除计时
-            if abs(tar_z) < 0.05:
+            if abs(tar_z) < 0.01:
                 self.get_logger().warn("Airborne & Target Z≈0. Triggering Land Mode...")
                 self.land()
             else:

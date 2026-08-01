@@ -816,10 +816,10 @@ class TFTrackingNode(Node):
         # RTH: 返航 — 返回偏移起飞点, 到达后降落
         # ============================
         elif self.state == FlightState.RTH:
-            # 持续发送抛投完成信号给小车
-            msg = Int32()
-            msg.data = 1
-            self.drop_complete_pub.publish(msg)
+            # 模式1才发drop_complete, 模式2不发
+            if self._car_mode == 1:
+                msg = Int32(); msg.data = 1
+                self.drop_complete_pub.publish(msg)
 
             rth_x = self.rth_offset_x
             rth_y = self.rth_offset_y
@@ -827,6 +827,11 @@ class TFTrackingNode(Node):
                 f'[RTH] 返航中, 返回 ({rth_x:.2f}, {rth_y:.2f})',
                 throttle_duration_sec=2.0)
             self.set_target_position(rth_x, rth_y, self.takeoff_height)
+
+            # 模式2持续发resume确保小车收到
+            if self._car_mode == 2:
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
 
             if self.check_arrived(rth_x, rth_y, self.takeoff_height):
                 self.get_logger().info(f'RTH → LAND (到达返航点 ({rth_x:.2f}, {rth_y:.2f}), 开始两段式降落)')
@@ -837,10 +842,13 @@ class TFTrackingNode(Node):
         # LAND: 两段式降落 — PID慢降至低空 → 触发PX4 land
         # ============================
         elif self.state == FlightState.LAND:
-            # 持续发送抛投完成信号给小车
-            msg = Int32()
-            msg.data = 1
-            self.drop_complete_pub.publish(msg)
+            # 模式1发drop_complete, 模式2发resume(持续确保小车收到)
+            if self._car_mode == 1:
+                msg = Int32(); msg.data = 1
+                self.drop_complete_pub.publish(msg)
+            elif self._car_mode == 2:
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
 
             rth_x = self.rth_offset_x
             rth_y = self.rth_offset_y
@@ -873,34 +881,47 @@ class TFTrackingNode(Node):
             if self._platform_enter_time is None:
                 self._platform_enter_time = self.get_clock().now()
 
-            px, py = self.vehicle_local_position.x, self.vehicle_local_position.y
+            px = self.vehicle_local_position.x
+            py = self.vehicle_local_position.y
             if math.isnan(px) or math.isnan(py):
                 px, py = 0.0, 0.0
 
-            # 微悬停在10cm (不设Z=0, 防止offboard触发land→disarm)
-            self.set_target_position(px, py, self.dynamic_land_height)
-
             elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
-            self.get_logger().info(
-                f'[PLATFORM_WAIT] 怠速等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s (不锁桨)...',
-                throttle_duration_sec=1.0)
 
-            if elapsed >= self.platform_wait_time:
-                self.get_logger().info('PLATFORM_WAIT → RTH, 通知小车恢复')
-                msg = Int32(); msg.data = 1
-                self.car_resume_pub.publish(msg)
-                self._platform_enter_time = None
+            if elapsed < self.platform_wait_time:
+                # Z=-0.02 贴车怠速 (offboard已改阈值0.01, 不会触发land)
+                self.set_target_position(px, py, -0.02)
+                self.get_logger().info(
+                    f'[PLATFORM_WAIT] 贴车怠速 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
+                    throttle_duration_sec=1.0)
+            elif elapsed < self.platform_wait_time + 2.0:
+                # 原地爬升 (不水平移动, 避免生硬)
                 self.set_target_position(px, py, self.takeoff_height)
+                self.get_logger().info(
+                    f'[PLATFORM_WAIT] 爬升 Z={self.vehicle_local_position.z:.2f}→{self.takeoff_height:.1f}',
+                    throttle_duration_sec=1.0)
+            else:
+                # 爬升完成→RTH
+                if not hasattr(self, '_resume_sent') or not self._resume_sent:
+                    self.get_logger().info('PLATFORM_WAIT → RTH, 通知小车恢复')
+                    msg = Int32(); msg.data = 1
+                    self.car_resume_pub.publish(msg)
+                    self._resume_sent = True
+                self._platform_enter_time = None
                 self.state = FlightState.RTH
 
         # ============================
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
         # ============================
         elif self.state == FlightState.DONE:
+            # 模式2持续发resume确保小车知道无人机已离开
+            if self._car_mode == 2:
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
+            self._car_mode = 0  # 清零防循环(INIT→TAKEOFF不会再触发)
             self.get_logger().info(
                 '[DONE] 持续发送 Z=0, 等待 PX4 落地锁桨...',
                 throttle_duration_sec=3.0)
-            # 持续发 Z=0: offboard_control tar_z≈0 → land() → 落地 → disarm
             self.set_target_position(self.rth_offset_x, self.rth_offset_y, 0.0)
 
 
