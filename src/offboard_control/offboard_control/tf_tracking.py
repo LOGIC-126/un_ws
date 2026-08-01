@@ -565,9 +565,9 @@ class TFTrackingNode(Node):
                                     self._land_arrive_time = self.get_clock().now()
                                 elapsed = (self.get_clock().now() - self._land_arrive_time).nanoseconds * 1e-9
                                 self.get_logger().info(
-                                    f'[模式2 降落] 阶段2: 已落车, 等待 {elapsed:.1f}s/2.0s 发话题...',
+                                    f'[模式2 降落] 阶段2: 已落车, 等待 {elapsed:.1f}s/3.0s 发话题...',
                                     throttle_duration_sec=1.0)
-                                if elapsed >= 2.0 and not self._land_complete_sent:
+                                if elapsed >= 3.0 and not self._land_complete_sent:
                                     self.get_logger().info(
                                         f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
                                     msg = Int32(); msg.data = 1
@@ -766,29 +766,36 @@ class TFTrackingNode(Node):
                     self.state = FlightState.DONE
 
         # ============================
-        # PLATFORM_WAIT: 模式2 落车后等待→起飞→通知小车→RTH
+        # PLATFORM_WAIT: 模式2 落车后等待→原地爬升→通知小车→RTH
         # ============================
         elif self.state == FlightState.PLATFORM_WAIT:
             if self._platform_enter_time is None:
                 self._platform_enter_time = self.get_clock().now()
 
-            # 保持Z=0 (站在车上)
-            self.set_target_position(self._hover_x, self._hover_y, 0.0)
-
             elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
-            self.get_logger().info(
-                f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
-                throttle_duration_sec=1.0)
 
-            if elapsed >= self.platform_wait_time:
-                # 起飞 → 通知小车恢复速度 → RTH
+            if elapsed < self.platform_wait_time:
+                # 保持Z=0 (站在车上)
+                self.set_target_position(self._hover_x, self._hover_y, 0.0)
                 self.get_logger().info(
-                    f'PLATFORM_WAIT → 起飞 → RTH (reuse模式1), 通知小车恢复')
-                msg = Int32(); msg.data = 1
-                self.car_resume_pub.publish(msg)
-                self._platform_enter_time = None
-                self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
-                self.state = FlightState.RTH
+                    f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
+                    throttle_duration_sec=1.0)
+            else:
+                # 原地爬升到巡航高度 (用当前位置, 不用_hover), 远离小车后再平飞RTH
+                px = self.vehicle_local_position.x
+                py = self.vehicle_local_position.y
+                if math.isnan(px) or math.isnan(py):
+                    px, py = self._hover_x, self._hover_y
+                self.set_target_position(px, py, self.takeoff_height)
+                self.get_logger().info(
+                    f'[PLATFORM_WAIT] 爬升中 Z={self.vehicle_local_position.z:.2f}→{self.takeoff_height:.1f}...',
+                    throttle_duration_sec=1.0)
+                if abs(self.vehicle_local_position.z - self.takeoff_height) < 0.3:
+                    self.get_logger().info('PLATFORM_WAIT → RTH (到达巡航高度, 通知小车恢复)')
+                    msg = Int32(); msg.data = 1
+                    self.car_resume_pub.publish(msg)
+                    self._platform_enter_time = None
+                    self.state = FlightState.RTH
 
         # ============================
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
