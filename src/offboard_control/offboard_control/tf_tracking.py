@@ -492,7 +492,7 @@ class TFTrackingNode(Node):
             elif self.state == FlightState.DROP:
                 drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
             elif self.state == FlightState.TRACK and self._car_mode == 2:
-                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s', 2: '降0cm落平台'}
+                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停0.3s', 2: '降0cm落平台'}
                 drop_hint = f" | 阶段{self._land_stage2}:{stages.get(self._land_stage2, '?')}"
             elif self.state == FlightState.PLATFORM_WAIT:
                 if self._platform_enter_time is not None:
@@ -633,7 +633,7 @@ class TFTrackingNode(Node):
                             self.get_logger().info(
                                 f'[模式2 降落] 10cm悬停 {elapsed:.1f}s/1.0s...',
                                 throttle_duration_sec=0.5)
-                            if elapsed >= 1.0:
+                            if elapsed >= 0.3:
                                 self.get_logger().info('[模式2 降落] 阶段1→2: 悬停完成, 降0cm落平台')
                                 self._land_stage2 = 2
                         else:
