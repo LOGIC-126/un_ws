@@ -50,9 +50,10 @@ class FlightState(Enum):
     TRACK = 3
     LOST = 4
     DROP = 5
-    RTH = 6    # Return To Home 返航
-    LAND = 7   # 降落
-    DONE = 8   # 任务完成
+    RTH = 6          # Return To Home 返航 (模式1)
+    LAND = 7         # 降落 (模式1)
+    DONE = 8         # 任务完成 (模式1)
+    DYNAMIC_LAND = 9 # 动态降落 (模式2: 靠近小车后逐渐降至10cm)
 
 
 class TFTrackingNode(Node):
@@ -85,6 +86,11 @@ class TFTrackingNode(Node):
         self.declare_parameter('rth_offset_x', -0.15)   # 返航点X偏移 NED (往后退, m)
         self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
 
+        # —— 动态降落 (模式2) ——
+        self.declare_parameter('dynamic_land_height', -0.1)    # 动态降落目标高度 NED (10cm)
+        self.declare_parameter('dynamic_land_dwell_time', 2.0) # 靠近小车 dwell 后触发动态降落 (s)
+        self.declare_parameter('dynamic_land_descent_time', 3.0) # 逐渐降落耗时 (s)
+
         # —— 视觉融合 (参考 yolo_tracking.py TRACK 视觉追踪逻辑) ——
         self.declare_parameter('enable_vision_fusion', False)
         self.declare_parameter('vision_match_threshold', 0.2)  # 识别与TF一致时用识别值代替(参考yolo_tracking)
@@ -101,6 +107,9 @@ class TFTrackingNode(Node):
         self.close_descent = self.get_parameter('close_descent').value
         self.rth_offset_x = self.get_parameter('rth_offset_x').value
         self.rth_offset_y = self.get_parameter('rth_offset_y').value
+        self.dynamic_land_height = self.get_parameter('dynamic_land_height').value
+        self.dynamic_land_dwell_time = self.get_parameter('dynamic_land_dwell_time').value
+        self.dynamic_land_descent_time = self.get_parameter('dynamic_land_descent_time').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
         self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
         self.land_low_height = -0.3  # 降落过渡高度 NED (30cm, 先PID慢降到此再触发land)
@@ -190,6 +199,11 @@ class TFTrackingNode(Node):
         self._drop_enter_time = None   # 进入DROP状态的时刻
         self._drop_servo_done = False  # 抛投舵机动作只执行一次
         self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
+
+        # 动态降落 (模式2)
+        self._dynamic_land_dwell_start = None   # TRACK中靠近小车的计时
+        self._dynamic_land_enter_time = None    # 进入DYNAMIC_LAND的时刻
+        self._dynamic_land_start_z = 0.0        # 进入DYNAMIC_LAND时的Z高度
 
         # —— 舵机串口 (抛投机构) ——
         self.servo_serial = None
@@ -482,6 +496,11 @@ class TFTrackingNode(Node):
                 drop_hint = f" | 抛投倒计时 {dwell:.1f}s/{self.drop_dwell_time}s (阈值{self.drop_distance_threshold}m)"
             elif self.state == FlightState.DROP:
                 drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
+            elif self.state == FlightState.DYNAMIC_LAND:
+                drop_hint = f" | 动态降落中 Z目标={self.dynamic_land_height:.1f}m"
+            elif self.state == FlightState.TRACK and self._car_mode == 2 and self._dynamic_land_dwell_start is not None:
+                dwell = (now - self._dynamic_land_dwell_start).nanoseconds * 1e-9
+                drop_hint = f" | 动态降落倒计时 {dwell:.1f}s/{self.dynamic_land_dwell_time}s"
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
@@ -524,12 +543,20 @@ class TFTrackingNode(Node):
             self.set_target_position(0.0, 0.0, self.takeoff_height)
 
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
-                self._record_hover_position()
-                self._reset_tracking_counters()
-                self._locked_target = None
-                self._wait_start_time = self.get_clock().now()
-                self.state = FlightState.WAIT
+                if self._car_mode == 2:
+                    # 模式2: 跳过WAIT, 直接进入TRACK追踪
+                    self.get_logger().info("TAKEOFF → TRACK (模式2, 跳过悬停等待)")
+                    self._record_hover_position()
+                    self._reset_tracking_counters()
+                    self._locked_target = None
+                    self.state = FlightState.TRACK
+                else:
+                    self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
+                    self._record_hover_position()
+                    self._reset_tracking_counters()
+                    self._locked_target = None
+                    self._wait_start_time = self.get_clock().now()
+                    self.state = FlightState.WAIT
 
         # ============================
         # WAIT: 悬停5s → 检测到小车即自动追踪
@@ -601,7 +628,22 @@ class TFTrackingNode(Node):
                                 return
                     else:
                         self._drop_start_time = None
-                # 模式2: 持续追踪, 不进入抛投 (后续扩展起降逻辑)
+                # 模式2 动态降落: 靠近小车 dwell → DYNAMIC_LAND
+                elif self._car_mode == 2:
+                    if dist < self.drop_distance_threshold:
+                        if self._dynamic_land_dwell_start is None:
+                            self._dynamic_land_dwell_start = self.get_clock().now()
+                        else:
+                            dwell = (self.get_clock().now() - self._dynamic_land_dwell_start).nanoseconds * 1e-9
+                            if dwell >= self.dynamic_land_dwell_time:
+                                self.get_logger().info(
+                                    f'TRACK → DYNAMIC_LAND (距小车 {dist:.2f}m, 停留 {dwell:.1f}s, 逐渐降至10cm)')
+                                self._dynamic_land_dwell_start = None
+                                self._dynamic_land_enter_time = None
+                                self.state = FlightState.DYNAMIC_LAND
+                                return
+                    else:
+                        self._dynamic_land_dwell_start = None
 
             else:
                 now = self.get_clock().now()
@@ -660,6 +702,42 @@ class TFTrackingNode(Node):
                     self._reset_tracking_counters()
                     self._locked_target = None
                     self.state = FlightState.WAIT
+
+        # ============================
+        # DYNAMIC_LAND: 动态降落 (模式2) — 持续追踪小车, 逐渐降至10cm
+        # ============================
+        elif self.state == FlightState.DYNAMIC_LAND:
+            if self._dynamic_land_enter_time is None:
+                self._dynamic_land_enter_time = self.get_clock().now()
+                self._dynamic_land_start_z = self.vehicle_local_position.z
+                self.get_logger().info(
+                    f'[DYNAMIC_LAND] 开始动态降落 Z={self._dynamic_land_start_z:.2f}→{self.dynamic_land_height:.1f}'
+                )
+
+            # 持续追踪小车
+            target = self._get_target_ned()
+            if target is not None:
+                ned_x, ned_y, _ = target
+                self._locked_target = (ned_x, ned_y)
+            elif self._locked_target is not None:
+                ned_x, ned_y = self._locked_target
+            else:
+                ned_x, ned_y = self._hover_x, self._hover_y
+
+            # 逐渐降高: 线性插值
+            elapsed = (self.get_clock().now() - self._dynamic_land_enter_time).nanoseconds * 1e-9
+            if elapsed < self.dynamic_land_descent_time:
+                ratio = elapsed / self.dynamic_land_descent_time
+                track_z = self._dynamic_land_start_z + (self.dynamic_land_height - self._dynamic_land_start_z) * ratio
+            else:
+                track_z = self.dynamic_land_height
+
+            self.set_target_position(ned_x, ned_y, track_z)
+
+            self.get_logger().info(
+                f'[DYNAMIC_LAND] Z={self.vehicle_local_position.z:.2f}→{track_z:.2f} '
+                f'({elapsed:.1f}s/{self.dynamic_land_descent_time}s)',
+                throttle_duration_sec=1.0)
 
         # ============================
         # DROP: 抛投 — 先降高→舵机抽拉→计时→返航
