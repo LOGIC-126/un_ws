@@ -152,6 +152,8 @@ class TFTrackingNode(Node):
             Int32, '/car/land_complete', 10)  # 模式2降落完成→小车减速
         self.car_resume_pub = self.create_publisher(
             Int32, '/car/resume', 10)         # 模式2起飞完成→小车恢复速度
+        self.status_pub = self.create_publisher(
+            Int32, '/uav/status', 10)         # 持续发布无人机状态给小车
 
         # ====== 订阅器 ======
         self.vehicle_local_pos_sub = self.create_subscription(
@@ -476,8 +478,27 @@ class TFTrackingNode(Node):
 
         self.run_state_machine()
 
+        # 持续发布状态给小车
+        self._publish_status()
+
         # 状态显示 (每2秒)
         self._print_status()
+
+    def _publish_status(self) -> None:
+        """持续发布无人机状态给小车: 0=起飞 1=抛投 2=降落 3=完成"""
+        s = self.state
+        if s == FlightState.TAKEOFF:
+            code = 0
+        elif s == FlightState.DROP:
+            code = 1
+        elif s == FlightState.LAND or (s == FlightState.TRACK and self._car_mode == 2 and self._land_stage2 >= 1):
+            code = 2  # 模式1 LAND 或 模式2 降落阶段
+        elif s in (FlightState.DONE, FlightState.PLATFORM_WAIT):
+            code = 3
+        else:
+            return  # 其他状态不改变小车状态
+        msg = Int32(); msg.data = code
+        self.status_pub.publish(msg)
 
     def _print_status(self) -> None:
         """每2秒打印追踪状态"""
