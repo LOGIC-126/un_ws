@@ -53,7 +53,8 @@ class FlightState(Enum):
     RTH = 6          # Return To Home 返航 (模式1)
     LAND = 7         # 降落 (模式1)
     DONE = 8         # 任务完成
-    PLATFORM_WAIT = 9 # 模式2: 落车后等待5s→返航
+    PLATFORM_WAIT = 9 # 模式2: 落车后等待→返航
+    RECOVER = 10      # 掉offboard后原地重起飞
 
 
 class TFTrackingNode(Node):
@@ -468,12 +469,11 @@ class TFTrackingNode(Node):
 
         if self.state not in (FlightState.INIT, FlightState.DROP,
                                FlightState.RTH, FlightState.LAND, FlightState.DONE,
-                               FlightState.PLATFORM_WAIT):
+                               FlightState.PLATFORM_WAIT, FlightState.RECOVER):
             if not is_armed or not is_offboard:
-                self.get_logger().warn("掉出 Offboard / 上锁状态, 退回 INIT.")
-                self.state = FlightState.INIT
+                self.get_logger().warn("掉出 Offboard / 上锁状态, 进入 RECOVER 原地重起飞")
+                self.state = FlightState.RECOVER
                 self._reset_tracking_counters()
-                self._locked_target = None
                 return
 
         self.run_state_machine()
@@ -532,6 +532,8 @@ class TFTrackingNode(Node):
                 if self._platform_enter_time is not None:
                     e = (now - self._platform_enter_time).nanoseconds * 1e-9
                     drop_hint = f" | 落车等待 {e:.1f}s→RTH"
+            elif self.state == FlightState.RECOVER:
+                drop_hint = " | 重起飞中"
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
@@ -886,29 +888,42 @@ class TFTrackingNode(Node):
             if math.isnan(px) or math.isnan(py):
                 px, py = 0.0, 0.0
 
-            elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
+            # 落车怠速: Z=0 触发land锁桨 (offboard阈值已改0.01, 结束后正常解锁起飞)
+            self.set_target_position(px, py, 0.0)
 
-            if elapsed < self.platform_wait_time:
-                # Z=-0.02 贴车怠速 (offboard已改阈值0.01, 不会触发land)
-                self.set_target_position(px, py, -0.02)
-                self.get_logger().info(
-                    f'[PLATFORM_WAIT] 贴车怠速 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
-                    throttle_duration_sec=1.0)
-            elif elapsed < self.platform_wait_time + 2.0:
-                # 原地爬升 (不水平移动, 避免生硬)
-                self.set_target_position(px, py, self.takeoff_height)
-                self.get_logger().info(
-                    f'[PLATFORM_WAIT] 爬升 Z={self.vehicle_local_position.z:.2f}→{self.takeoff_height:.1f}',
-                    throttle_duration_sec=1.0)
-            else:
-                # 爬升完成→RTH
-                if not hasattr(self, '_resume_sent') or not self._resume_sent:
-                    self.get_logger().info('PLATFORM_WAIT → RTH, 通知小车恢复')
-                    msg = Int32(); msg.data = 1
-                    self.car_resume_pub.publish(msg)
-                    self._resume_sent = True
+            elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
+            self.get_logger().info(
+                f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
+                throttle_duration_sec=1.0)
+
+            if elapsed >= self.platform_wait_time:
+                self.get_logger().info('PLATFORM_WAIT → RTH, 通知小车恢复')
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
                 self._platform_enter_time = None
+                self.set_target_position(px, py, self.takeoff_height)
                 self.state = FlightState.RTH
+
+        # ============================
+        # RECOVER: 掉offboard后原地重起飞→回到TRACK
+        # ============================
+        elif self.state == FlightState.RECOVER:
+            px = self.vehicle_local_position.x
+            py = self.vehicle_local_position.y
+            if math.isnan(px) or math.isnan(py):
+                px, py = 0.0, 0.0
+            self.set_target_position(px, py, self.takeoff_height)
+
+            is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
+            is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
+            self.get_logger().info(
+                f'[RECOVER] 原地重起飞 pos=({px:.2f},{py:.2f}) arm={is_armed} off={is_offboard}',
+                throttle_duration_sec=1.0)
+
+            if is_armed and is_offboard and self.check_arrived(px, py, self.takeoff_height):
+                self.get_logger().info('RECOVER → TRACK (重起飞完成, 继续追踪)')
+                self._reset_tracking_counters()
+                self.state = FlightState.TRACK
 
         # ============================
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
