@@ -565,7 +565,7 @@ class TFTrackingNode(Node):
                     self._land_complete_sent = False
                     self.state = FlightState.TRACK
                 else:
-                    self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
+                    self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停0.3s)")
                     self._record_hover_position()
                     self._reset_tracking_counters()
                     self._locked_target = None
@@ -578,13 +578,10 @@ class TFTrackingNode(Node):
         elif self.state == FlightState.WAIT:
             self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
 
-            # 悬停5秒后再开始检测
+            # 悬停0.3s后开始检测
             if self._wait_start_time is not None:
                 hover_elapsed = (self.get_clock().now() - self._wait_start_time).nanoseconds * 1e-9
-                if hover_elapsed < 2.0:
-                    self.get_logger().info(
-                        f'[WAIT] 悬停等待 {hover_elapsed:.1f}s/2.0s...',
-                        throttle_duration_sec=1.0)
+                if hover_elapsed < 0.3:
                     return
                 else:
                     self._wait_start_time = None  # 计时完成
@@ -855,8 +852,10 @@ class TFTrackingNode(Node):
             if self._platform_enter_time is None:
                 self._platform_enter_time = self.get_clock().now()
 
-            # 保持Z=0 (站在车上)
-            self.set_target_position(self._hover_x, self._hover_y, 0.0)
+            # 站在车上: 保持当前位置 Z=0 (不能用_hover_x/y, 车已开走!)
+            px, py = self.vehicle_local_position.x, self.vehicle_local_position.y
+            if not (math.isnan(px) or math.isnan(py)):
+                self.set_target_position(px, py, 0.0)
 
             elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
             self.get_logger().info(
@@ -866,11 +865,12 @@ class TFTrackingNode(Node):
             if elapsed >= self.platform_wait_time:
                 # 起飞 → 通知小车恢复速度 → RTH
                 self.get_logger().info(
-                    f'PLATFORM_WAIT → 起飞 → RTH (reuse模式1), 通知小车恢复')
+                    f'PLATFORM_WAIT → 起飞 → RTH, 通知小车恢复')
                 msg = Int32(); msg.data = 1
                 self.car_resume_pub.publish(msg)
                 self._platform_enter_time = None
-                self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
+                # 从当前位置爬升, RTH接手水平引导
+                self.set_target_position(px, py, self.takeoff_height)
                 self.state = FlightState.RTH
 
         # ============================
