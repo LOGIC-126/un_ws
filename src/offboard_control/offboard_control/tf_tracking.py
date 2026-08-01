@@ -88,9 +88,10 @@ class TFTrackingNode(Node):
         # —— 模式2 追踪降落 (参考模式1 DROP: 追上后直接设目标Z, PID自然下降) ——
         self.declare_parameter('dynamic_land_height', -0.1)      # 降落目标高度 NED (10cm)
 
-        # —— 视觉融合 (参考 yolo_tracking.py TRACK 视觉追踪逻辑) ——
-        self.declare_parameter('enable_vision_fusion', False)
-        self.declare_parameter('vision_match_threshold', 0.2)  # 识别与TF一致时用识别值代替(参考yolo_tracking)
+        # —— 视觉矫正 (YOLO识别矫正car_offset, EMA平滑, 让TF追踪越来越准) ——
+        self.declare_parameter('enable_vision_fusion', True)
+        self.declare_parameter('vision_match_threshold', 0.2)    # 识别与TF一致时触发矫正
+        self.declare_parameter('offset_correction_alpha', 0.1)   # EMA平滑系数 (0~1, 越小越平滑)
         self.declare_parameter('fence_radius', 1.5)
 
         # 读取参数值
@@ -118,6 +119,7 @@ class TFTrackingNode(Node):
 
         self.enable_vision_fusion = self.get_parameter('enable_vision_fusion').value
         self.vision_match_threshold = self.get_parameter('vision_match_threshold').value
+        self.offset_correction_alpha = self.get_parameter('offset_correction_alpha').value
         self.fence_radius = self.get_parameter('fence_radius').value
 
         # ====== TF2 监听器 (多话题: /tf + /car/tf, 参考 waypoint_tracker) ======
@@ -349,9 +351,8 @@ class TFTrackingNode(Node):
         """
         获取追踪目标 NED 坐标。
 
-        纯 TF 模式: 直接返回 TF 查询结果
-        融合模式: TF 为主, 识别值与 TF 一致(≤vision_match_threshold)时用识别值代替
-                  (参考 yolo_tracking.py TRACK 状态 L341-385: 视觉检测→锁定→追踪)
+        TF 查询 + 视觉矫正: YOLO识别→矫正car_offset(EMA平滑), 让TF追踪越来越准
+        不再用识别值替代TF, 而是持续修正偏移量。
 
         返回 (ned_x, ned_y, distance) 或 None
         """
@@ -370,19 +371,22 @@ class TFTrackingNode(Node):
         if dist > self.max_distance:
             return None
 
-        # —— 视觉融合 (参考 yolo_tracking.py _select_nearest_target L180-210) ——
-        # 识别值与TF坐标相距≤阈值(0.2m) → 用识别值代替TF追踪
+        # —— 视觉矫正 car_offset (EMA平滑, 让TF越来越准) ——
+        # TF与YOLO一致(≤0.2m)时: offset += alpha * (yolo - tf)
+        # NED→FLU: x方向相同, y方向取反 (ned_east→ros_west)
         if self.enable_vision_fusion and self._latest_detections is not None:
             yolo_target = self._match_vision_to_car(car)
             if yolo_target is not None:
                 yolo_x, yolo_y = yolo_target
-                d_vision_tf = math.hypot(yolo_x - car[0], yolo_y - car[1])
+                err_x = yolo_x - car[0]         # NED north 误差
+                err_y = -(yolo_y - car[1])       # NED east→FLU west (取反)
+                a = self.offset_correction_alpha
+                self.car_offset_x += a * err_x
+                self.car_offset_y += a * err_y
+                d_err = math.hypot(err_x, yolo_y - car[1])
                 self.get_logger().info(
-                    f'视觉替用: 识别→TF偏移={d_vision_tf:.2f}m≤{self.vision_match_threshold}m, '
-                    f'使用识别值 NED({yolo_x:.2f}, {yolo_y:.2f})',
-                    throttle_duration_sec=1.0)
-                yolo_dist = math.hypot(yolo_x - drone.x, yolo_y - drone.y)
-                return (yolo_x, yolo_y, yolo_dist)
+                    f'视觉矫正: err={d_err:.3f}m offset=({self.car_offset_x:.3f}, {self.car_offset_y:.3f})',
+                    throttle_duration_sec=2.0)
 
         return (car[0], car[1], dist)
 
