@@ -86,7 +86,7 @@ class TFTrackingNode(Node):
         self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
 
         # —— 视觉融合 (参考 yolo_tracking.py TRACK 视觉追踪逻辑) ——
-        self.declare_parameter('enable_vision_fusion', True)
+        self.declare_parameter('enable_vision_fusion', False)
         self.declare_parameter('vision_match_threshold', 0.2)  # 识别与TF一致时用识别值代替(参考yolo_tracking)
         self.declare_parameter('fence_radius', 1.5)
 
