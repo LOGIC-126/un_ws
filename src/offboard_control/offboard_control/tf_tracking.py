@@ -625,6 +625,9 @@ class TFTrackingNode(Node):
                         elif self._land_stage2 == 1:
                             track_z = self.dynamic_land_height
                             elapsed = (self.get_clock().now() - self._land_stage2_time).nanoseconds * 1e-9
+                            self.get_logger().info(
+                                f'[模式2 降落] 10cm悬停 {elapsed:.1f}s/1.0s...',
+                                throttle_duration_sec=0.5)
                             if elapsed >= 1.0:
                                 self.get_logger().info('[模式2 降落] 阶段1→2: 悬停完成, 降0cm落平台')
                                 self._land_stage2 = 2
