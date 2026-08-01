@@ -53,6 +53,7 @@ class FlightState(Enum):
     RTH = 6          # Return To Home 返航 (模式1)
     LAND = 7         # 降落 (模式1)
     DONE = 8         # 任务完成
+    PLATFORM_WAIT = 9 # 模式2: 落车后等待5s→返航
 
 
 class TFTrackingNode(Node):
@@ -87,6 +88,7 @@ class TFTrackingNode(Node):
 
         # —— 模式2 追踪降落 (参考模式1 DROP: 追上后直接设目标Z, PID自然下降) ——
         self.declare_parameter('dynamic_land_height', -0.1)      # 降落目标高度 NED (10cm)
+        self.declare_parameter('platform_wait_time', 5.0)        # 落车后等待时间 (s)
 
         # —— 视觉矫正 (YOLO识别矫正car_offset, EMA平滑, 让TF追踪越来越准) ——
         self.declare_parameter('enable_vision_fusion', True)
@@ -106,6 +108,7 @@ class TFTrackingNode(Node):
         self.rth_offset_x = self.get_parameter('rth_offset_x').value
         self.rth_offset_y = self.get_parameter('rth_offset_y').value
         self.dynamic_land_height = self.get_parameter('dynamic_land_height').value
+        self.platform_wait_time = self.get_parameter('platform_wait_time').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
         self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
         self.land_low_height = -0.3  # 降落过渡高度 NED (30cm, 先PID慢降到此再触发land)
@@ -146,7 +149,9 @@ class TFTrackingNode(Node):
         self.drop_complete_pub = self.create_publisher(
             Int32, '/car/drop_complete', 10)
         self.land_complete_pub = self.create_publisher(
-            Int32, '/car/land_complete', 10)  # 模式2降落完成通知小车
+            Int32, '/car/land_complete', 10)  # 模式2降落完成→小车减速
+        self.car_resume_pub = self.create_publisher(
+            Int32, '/car/resume', 10)         # 模式2起飞完成→小车恢复速度
 
         # ====== 订阅器 ======
         self.vehicle_local_pos_sub = self.create_subscription(
@@ -203,6 +208,7 @@ class TFTrackingNode(Node):
         self._land_stage2 = 0              # 0=降10cm, 1=等1s, 2=降0cm
         self._land_stage2_time = None      # 阶段计时
         self._land_complete_sent = False   # 降落完成话题已发送
+        self._platform_enter_time = None   # PLATFORM_WAIT进入时刻
 
         # —— 舵机串口 (抛投机构) ——
         self.servo_serial = None
@@ -459,7 +465,8 @@ class TFTrackingNode(Node):
         is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
 
         if self.state not in (FlightState.INIT, FlightState.DROP,
-                               FlightState.RTH, FlightState.LAND, FlightState.DONE):
+                               FlightState.RTH, FlightState.LAND, FlightState.DONE,
+                               FlightState.PLATFORM_WAIT):
             if not is_armed or not is_offboard:
                 self.get_logger().warn("掉出 Offboard / 上锁状态, 退回 INIT.")
                 self.state = FlightState.INIT
@@ -500,6 +507,10 @@ class TFTrackingNode(Node):
             elif self.state == FlightState.TRACK and self._car_mode == 2:
                 stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s', 2: '降0cm落平台'}
                 drop_hint = f" | 阶段{self._land_stage2}:{stages.get(self._land_stage2, '?')}"
+            elif self.state == FlightState.PLATFORM_WAIT:
+                if self._platform_enter_time is not None:
+                    e = (now - self._platform_enter_time).nanoseconds * 1e-9
+                    drop_hint = f" | 落车等待 {e:.1f}s→RTH"
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
@@ -642,11 +653,12 @@ class TFTrackingNode(Node):
                                 throttle_duration_sec=1.0)
                             if abs(self.vehicle_local_position.z) < 0.05 and not self._land_complete_sent:
                                 self.get_logger().info(
-                                    f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → DONE')
+                                    f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
                                 msg = Int32(); msg.data = 1
-                                self.land_complete_pub.publish(msg)
+                                self.land_complete_pub.publish(msg)  # 通知小车减速
                                 self._land_complete_sent = True
-                                self.state = FlightState.DONE
+                                self._platform_enter_time = self.get_clock().now()
+                                self.state = FlightState.PLATFORM_WAIT
                                 return
                     else:
                         track_z = base_z
@@ -835,6 +847,31 @@ class TFTrackingNode(Node):
                 if self.vehicle_local_position.z >= -0.15:
                     self.get_logger().info('LAND → DONE (已着陆, 等待锁桨)')
                     self.state = FlightState.DONE
+
+        # ============================
+        # PLATFORM_WAIT: 模式2 落车后等待→起飞→通知小车→RTH
+        # ============================
+        elif self.state == FlightState.PLATFORM_WAIT:
+            if self._platform_enter_time is None:
+                self._platform_enter_time = self.get_clock().now()
+
+            # 保持Z=0 (站在车上)
+            self.set_target_position(self._hover_x, self._hover_y, 0.0)
+
+            elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
+            self.get_logger().info(
+                f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
+                throttle_duration_sec=1.0)
+
+            if elapsed >= self.platform_wait_time:
+                # 起飞 → 通知小车恢复速度 → RTH
+                self.get_logger().info(
+                    f'PLATFORM_WAIT → 起飞 → RTH (reuse模式1), 通知小车恢复')
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
+                self._platform_enter_time = None
+                self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
+                self.state = FlightState.RTH
 
         # ============================
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
