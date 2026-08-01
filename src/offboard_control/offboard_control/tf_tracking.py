@@ -852,26 +852,32 @@ class TFTrackingNode(Node):
             if self._platform_enter_time is None:
                 self._platform_enter_time = self.get_clock().now()
 
-            # 站在车上: 保持当前位置 Z=0 (不能用_hover_x/y, 车已开走!)
             px, py = self.vehicle_local_position.x, self.vehicle_local_position.y
-            if not (math.isnan(px) or math.isnan(py)):
-                self.set_target_position(px, py, 0.0)
+            if math.isnan(px) or math.isnan(py):
+                px, py = 0.0, 0.0
 
             elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
-            self.get_logger().info(
-                f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
-                throttle_duration_sec=1.0)
 
-            if elapsed >= self.platform_wait_time:
-                # 起飞 → 通知小车恢复速度 → RTH
+            if elapsed < self.platform_wait_time:
+                # 阶段A: 站在车上, Z=0 (会触发land/disarm)
+                self.set_target_position(px, py, 0.0)
                 self.get_logger().info(
-                    f'PLATFORM_WAIT → 起飞 → RTH, 通知小车恢复')
-                msg = Int32(); msg.data = 1
-                self.car_resume_pub.publish(msg)
-                self._platform_enter_time = None
-                # 从当前位置爬升, RTH接手水平引导
+                    f'[PLATFORM_WAIT] 落车 {elapsed:.1f}s/{self.platform_wait_time:.1f}s → 锁桨中...',
+                    throttle_duration_sec=1.0)
+            else:
+                # 阶段B: 设起飞目标, 等offboard重新解锁→RTH
                 self.set_target_position(px, py, self.takeoff_height)
-                self.state = FlightState.RTH
+                is_armed = (self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED)
+                is_offboard = (self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD)
+                self.get_logger().info(
+                    f'[PLATFORM_WAIT] 等待重解锁 arm={is_armed} offboard={is_offboard}...',
+                    throttle_duration_sec=0.5)
+                if is_armed and is_offboard:
+                    self.get_logger().info('PLATFORM_WAIT → RTH (已重解锁), 通知小车恢复')
+                    msg = Int32(); msg.data = 1
+                    self.car_resume_pub.publish(msg)
+                    self._platform_enter_time = None
+                    self.state = FlightState.RTH
 
         # ============================
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
