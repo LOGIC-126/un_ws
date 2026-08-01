@@ -526,7 +526,7 @@ class TFTrackingNode(Node):
             elif self.state == FlightState.DROP:
                 drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
             elif self.state == FlightState.TRACK and self._car_mode == 2:
-                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s'}
+                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s', 2: '贴车2cm'}
                 drop_hint = f" | 阶段{self._land_stage2}:{stages.get(self._land_stage2, '?')}"
             elif self.state == FlightState.PLATFORM_WAIT:
                 if self._platform_enter_time is not None:
@@ -667,11 +667,11 @@ class TFTrackingNode(Node):
                                 self.get_logger().info('[模式2 降落] 阶段1→2: 悬停完成, 降0cm落平台')
                                 self._land_stage2 = 2
                         else:
-                            track_z = 0.0
+                            track_z = 0.02  # 正数=地下, abs>0.05绕过land, 怠速贴车
                             self.get_logger().info(
-                                f'[模式2 降落] 阶段2: 降0cm中 Z={self.vehicle_local_position.z:.2f}',
+                                f'[模式2 降落] 阶段2: 贴车2cm Z={self.vehicle_local_position.z:.2f}',
                                 throttle_duration_sec=1.0)
-                            if abs(self.vehicle_local_position.z) < 0.05 and not self._land_complete_sent:
+                            if abs(self.vehicle_local_position.z - 0.02) < 0.05 and not self._land_complete_sent:
                                 self.get_logger().info(
                                     f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
                                 msg = Int32(); msg.data = 1
@@ -888,8 +888,8 @@ class TFTrackingNode(Node):
             if math.isnan(px) or math.isnan(py):
                 px, py = 0.0, 0.0
 
-            # 落车怠速: Z=0 触发land锁桨 (offboard阈值已改0.01, 结束后正常解锁起飞)
-            self.set_target_position(px, py, 0.0)
+            # Z=0.02正数=地下, abs>0.05绕过land, 怠速贴车不解锁
+            self.set_target_position(px, py, 0.02)
 
             elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
             self.get_logger().info(
