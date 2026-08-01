@@ -85,6 +85,8 @@ class TFTrackingNode(Node):
         self.declare_parameter('close_descent', 0.25)   # 靠近小车时逐渐降落高度 NED (m)
         self.declare_parameter('rth_offset_x', -0.15)   # 返航点X偏移 NED (往后退, m)
         self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
+        self.declare_parameter('mode2_land_x', 3.125)   # 模式2降落点X NED (前312.5cm, m)
+        self.declare_parameter('mode2_land_y', 1.125)   # 模式2降落点Y NED (右112.5cm, m)
 
         # —— 模式2 追踪降落 (参考模式1 DROP: 追上后直接设目标Z, PID自然下降) ——
         self.declare_parameter('dynamic_land_height', -0.1)      # 降落目标高度 NED (10cm)
@@ -101,6 +103,8 @@ class TFTrackingNode(Node):
         self.close_descent = self.get_parameter('close_descent').value
         self.rth_offset_x = self.get_parameter('rth_offset_x').value
         self.rth_offset_y = self.get_parameter('rth_offset_y').value
+        self.mode2_land_x = self.get_parameter('mode2_land_x').value
+        self.mode2_land_y = self.get_parameter('mode2_land_y').value
         self.dynamic_land_height = self.get_parameter('dynamic_land_height').value
         self.platform_wait_time = self.get_parameter('platform_wait_time').value
         self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
@@ -715,20 +719,24 @@ class TFTrackingNode(Node):
         # RTH: 返航 — 返回偏移起飞点, 到达后降落
         # ============================
         elif self.state == FlightState.RTH:
-            # 持续发送抛投完成信号给小车
-            msg = Int32()
-            msg.data = 1
-            self.drop_complete_pub.publish(msg)
+            # 持续发送速度信号给小车
+            msg = Int32(); msg.data = 1
+            if self._car_mode == 2:
+                self.car_resume_pub.publish(msg)
+                rth_x = self.mode2_land_x
+                rth_y = self.mode2_land_y
+            else:
+                self.drop_complete_pub.publish(msg)
+                rth_x = self.rth_offset_x
+                rth_y = self.rth_offset_y
 
-            rth_x = self.rth_offset_x
-            rth_y = self.rth_offset_y
             self.get_logger().info(
-                f'[RTH] 返航中, 返回 ({rth_x:.2f}, {rth_y:.2f})',
+                f'[RTH] 返航中, 目标 ({rth_x:.2f}, {rth_y:.2f})',
                 throttle_duration_sec=2.0)
             self.set_target_position(rth_x, rth_y, self.takeoff_height)
 
             if self.check_arrived(rth_x, rth_y, self.takeoff_height):
-                self.get_logger().info(f'RTH → LAND (到达返航点 ({rth_x:.2f}, {rth_y:.2f}), 开始两段式降落)')
+                self.get_logger().info(f'RTH → LAND (到达目标点 ({rth_x:.2f}, {rth_y:.2f}), 开始两段式降落)')
                 self._land_stage = 0
                 self.state = FlightState.LAND
 
@@ -736,10 +744,12 @@ class TFTrackingNode(Node):
         # LAND: 两段式降落 — PID慢降至低空 → 触发PX4 land
         # ============================
         elif self.state == FlightState.LAND:
-            # 持续发送抛投完成信号给小车
-            msg = Int32()
-            msg.data = 1
-            self.drop_complete_pub.publish(msg)
+            # 持续发送速度信号给小车
+            msg = Int32(); msg.data = 1
+            if self._car_mode == 2:
+                self.car_resume_pub.publish(msg)
+            else:
+                self.drop_complete_pub.publish(msg)
 
             rth_x = self.rth_offset_x
             rth_y = self.rth_offset_y
@@ -801,11 +811,18 @@ class TFTrackingNode(Node):
         # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
         # ============================
         elif self.state == FlightState.DONE:
+            # 模式2持续确保小车恢复速度
+            if self._car_mode == 2:
+                msg = Int32(); msg.data = 1
+                self.car_resume_pub.publish(msg)
+                land_x, land_y = self.mode2_land_x, self.mode2_land_y
+            else:
+                land_x, land_y = self.rth_offset_x, self.rth_offset_y
+            self._car_mode = 0  # 清零防循环
             self.get_logger().info(
                 '[DONE] 持续发送 Z=0, 等待 PX4 落地锁桨...',
                 throttle_duration_sec=3.0)
-            # 持续发 Z=0: offboard_control tar_z≈0 → land() → 落地 → disarm
-            self.set_target_position(self.rth_offset_x, self.rth_offset_y, 0.0)
+            self.set_target_position(land_x, land_y, 0.0)
 
 
 def main(args=None):
