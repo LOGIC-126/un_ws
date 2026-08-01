@@ -197,8 +197,10 @@ class TFTrackingNode(Node):
         self._drop_servo_done = False  # 抛投舵机动作只执行一次
         self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
 
-        # 模式2 追踪降落 (参考模式1 DROP: 直接设目标Z, PID自然下降)
-        self._land_complete_sent = False       # 降落完成话题已发送
+        # 模式2 追踪降落 (两段式: 先降10cm→等1s→降0cm落平台)
+        self._land_stage2 = 0              # 0=降10cm, 1=等1s, 2=降0cm
+        self._land_stage2_time = None      # 阶段计时
+        self._land_complete_sent = False   # 降落完成话题已发送
 
         # —— 舵机串口 (抛投机构) ——
         self.servo_serial = None
@@ -492,7 +494,8 @@ class TFTrackingNode(Node):
             elif self.state == FlightState.DROP:
                 drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
             elif self.state == FlightState.TRACK and self._car_mode == 2:
-                drop_hint = f" | 追踪降落 Z→{self.dynamic_land_height:.1f}m (PID)"
+                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s', 2: '降0cm落平台'}
+                drop_hint = f" | 阶段{self._land_stage2}:{stages.get(self._land_stage2, '?')}"
             self.get_logger().info(
                 f"[{state_name}] "
                 f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
@@ -542,6 +545,8 @@ class TFTrackingNode(Node):
                     self._record_hover_position()
                     self._reset_tracking_counters()
                     self._locked_target = None
+                    self._land_stage2 = 0
+                    self._land_stage2_time = None
                     self._land_complete_sent = False
                     self.state = FlightState.TRACK
                 else:
@@ -608,28 +613,45 @@ class TFTrackingNode(Node):
                 base_z = self.takeoff_height + self.close_descent * close_ratio
 
                 if self._car_mode == 2:
-                    # 模式2 追踪降落: 追上后直接设目标Z, PID自然下降 (参考模式1 DROP)
+                    # 模式2 两段式降落 (参考模式1 LAND): 降10cm→等1s→降0cm落平台
                     if dist < self.drop_distance_threshold:
-                        # 追上→降到动态降落高度 (PID自然下降, 无需手动插值)
-                        track_z = self.dynamic_land_height
-                        self.get_logger().info(
-                            f'追踪降落中 Z→{self.dynamic_land_height:.1f}m',
-                            throttle_duration_sec=1.0)
-
-                        # 检测触地 → 通知小车 → DONE
-                        if (self.vehicle_local_position.z >= self.dynamic_land_height + 0.05
-                                and not self._land_complete_sent):
-                            self.get_logger().info(
-                                f'TRACK → DONE (模式2降落完成 Z={self.vehicle_local_position.z:.2f})')
-                            msg = Int32()
-                            msg.data = 1
-                            self.land_complete_pub.publish(msg)
-                            self._land_complete_sent = True
-                            self.state = FlightState.DONE
-                            return
+                        if self._land_stage2 == 0:
+                            # 阶段0: 降到10cm
+                            track_z = self.dynamic_land_height
+                            if self.vehicle_local_position.z >= self.dynamic_land_height + 0.05:
+                                self.get_logger().info(
+                                    f'[模式2] 阶段0完成 Z={self.vehicle_local_position.z:.2f}, 悬停1s')
+                                self._land_stage2 = 1
+                                self._land_stage2_time = self.get_clock().now()
+                        elif self._land_stage2 == 1:
+                            # 阶段1: 10cm悬停1s
+                            track_z = self.dynamic_land_height
+                            elapsed = (self.get_clock().now() - self._land_stage2_time).nanoseconds * 1e-9
+                            if elapsed >= 1.0:
+                                self.get_logger().info('[模式2] 阶段1完成 → 降0cm落平台')
+                                self._land_stage2 = 2
+                            else:
+                                self.get_logger().info(
+                                    f'[模式2] 10cm悬停 {elapsed:.1f}s/1.0s...',
+                                    throttle_duration_sec=0.5)
+                        else:
+                            # 阶段2: 降0cm落平台
+                            track_z = 0.0
+                            if (self.vehicle_local_position.z >= -0.05
+                                    and not self._land_complete_sent):
+                                self.get_logger().info(
+                                    f'TRACK → DONE (模式2降落完成, 已落平台 Z={self.vehicle_local_position.z:.2f})')
+                                msg = Int32()
+                                msg.data = 1
+                                self.land_complete_pub.publish(msg)
+                                self._land_complete_sent = True
+                                self.state = FlightState.DONE
+                                return
                     else:
-                        # 还没追上: 保持追踪高度
+                        # 还没追上: 保持追踪高度, 重置降落阶段
                         track_z = base_z
+                        self._land_stage2 = 0
+                        self._land_stage2_time = None
                 else:
                     track_z = base_z
 
