@@ -613,42 +613,35 @@ class TFTrackingNode(Node):
                 base_z = self.takeoff_height + self.close_descent * close_ratio
 
                 if self._car_mode == 2:
-                    # 模式2 两段式降落 (参考模式1 LAND): 降10cm→等1s→降0cm落平台
+                    # 模式2 两段式降落: 降10cm→等1s→降0cm落平台
                     if dist < self.drop_distance_threshold:
                         if self._land_stage2 == 0:
-                            # 阶段0: 降到10cm
                             track_z = self.dynamic_land_height
-                            if self.vehicle_local_position.z >= self.dynamic_land_height + 0.05:
+                            if abs(self.vehicle_local_position.z - self.dynamic_land_height) < 0.05:
                                 self.get_logger().info(
-                                    f'[模式2] 阶段0完成 Z={self.vehicle_local_position.z:.2f}, 悬停1s')
+                                    f'[模式2 降落] 阶段0→1: 到达10cm Z={self.vehicle_local_position.z:.2f}, 悬停1s')
                                 self._land_stage2 = 1
                                 self._land_stage2_time = self.get_clock().now()
                         elif self._land_stage2 == 1:
-                            # 阶段1: 10cm悬停1s
                             track_z = self.dynamic_land_height
                             elapsed = (self.get_clock().now() - self._land_stage2_time).nanoseconds * 1e-9
                             if elapsed >= 1.0:
-                                self.get_logger().info('[模式2] 阶段1完成 → 降0cm落平台')
+                                self.get_logger().info('[模式2 降落] 阶段1→2: 悬停完成, 降0cm落平台')
                                 self._land_stage2 = 2
-                            else:
-                                self.get_logger().info(
-                                    f'[模式2] 10cm悬停 {elapsed:.1f}s/1.0s...',
-                                    throttle_duration_sec=0.5)
                         else:
-                            # 阶段2: 降0cm落平台
                             track_z = 0.0
-                            if (self.vehicle_local_position.z >= -0.05
-                                    and not self._land_complete_sent):
+                            self.get_logger().info(
+                                f'[模式2 降落] 阶段2: 降0cm中 Z={self.vehicle_local_position.z:.2f}',
+                                throttle_duration_sec=1.0)
+                            if abs(self.vehicle_local_position.z) < 0.05 and not self._land_complete_sent:
                                 self.get_logger().info(
-                                    f'TRACK → DONE (模式2降落完成, 已落平台 Z={self.vehicle_local_position.z:.2f})')
-                                msg = Int32()
-                                msg.data = 1
+                                    f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → DONE')
+                                msg = Int32(); msg.data = 1
                                 self.land_complete_pub.publish(msg)
                                 self._land_complete_sent = True
                                 self.state = FlightState.DONE
                                 return
                     else:
-                        # 还没追上: 保持追踪高度, 重置降落阶段
                         track_z = base_z
                         self._land_stage2 = 0
                         self._land_stage2_time = None
