@@ -39,7 +39,7 @@ import tf_transformations
 
 from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
 from std_msgs.msg import Int32
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose
 
 
 # ====== 状态枚举 ======
@@ -90,12 +90,6 @@ class TFTrackingNode(Node):
         self.declare_parameter('dynamic_land_height', -0.1)      # 降落目标高度 NED (10cm)
         self.declare_parameter('platform_wait_time', 5.0)        # 落车后等待时间 (s)
 
-        # —— 视觉矫正 (YOLO识别矫正car_offset, EMA平滑, 让TF追踪越来越准) ——
-        self.declare_parameter('enable_vision_fusion', True)
-        self.declare_parameter('vision_match_threshold', 0.2)    # 识别与TF一致时触发矫正
-        self.declare_parameter('offset_correction_alpha', 0.1)   # EMA平滑系数 (0~1, 越小越平滑)
-        self.declare_parameter('fence_radius', 1.5)
-
         # 读取参数值
         self.takeoff_height = self.get_parameter('takeoff_height').value
         self.arrival_threshold = self.get_parameter('arrival_threshold').value
@@ -119,11 +113,6 @@ class TFTrackingNode(Node):
         self.car_offset_x = self.get_parameter('car.offset_x').value
         self.car_offset_y = self.get_parameter('car.offset_y').value
         self.max_distance = self.get_parameter('max_distance').value
-
-        self.enable_vision_fusion = self.get_parameter('enable_vision_fusion').value
-        self.vision_match_threshold = self.get_parameter('vision_match_threshold').value
-        self.offset_correction_alpha = self.get_parameter('offset_correction_alpha').value
-        self.fence_radius = self.get_parameter('fence_radius').value
 
         # ====== TF2 监听器 (多话题: /tf + /car/tf, 参考 waypoint_tracker) ======
         self.tf_buffer = tf2_ros.Buffer()
@@ -161,12 +150,6 @@ class TFTrackingNode(Node):
             VehicleStatus, '/fmu/out/vehicle_status_v2',
             self.vehicle_status_callback, qos_profile)
 
-        # —— YOLO 视觉检测 (始终订阅, 参考 yolo_tracking.py TRACK 视觉追踪) ——
-        # 数据来源: rknn_yolo/yolo_detector_node.cpp → detection_world_node → /detection/world_coordinates
-        self.world_coords_sub = self.create_subscription(
-            PoseArray, '/detection/world_coordinates',
-            self.world_coordinates_callback, 10)
-
         # —— 小车启动触发 (waypoint_tracker 行驶≥0.5m 后发布) ——
         # _car_mode: 0=未触发, 1=模式1(跟踪抛投), 2=模式2(跟踪起降, 当前仅追踪)
         self._car_mode = 0
@@ -181,9 +164,6 @@ class TFTrackingNode(Node):
 
         # 小车位姿缓存 (无人机 NED 坐标系)
         self._car_ned = None             # (ned_x, ned_y) or None
-
-        # 检测数据缓存 (视觉融合)
-        self._latest_detections = None
 
         # 目标确认计数器
         self._car_detection_count = 0
@@ -208,6 +188,7 @@ class TFTrackingNode(Node):
         self._land_stage2 = 0              # 0=降10cm, 1=等1s, 2=降0cm
         self._land_stage2_time = None      # 阶段计时
         self._land_complete_sent = False   # 降落完成话题已发送
+        self._land_arrive_time = None      # 落地到车时刻, 等2s后发话题
         self._platform_enter_time = None   # PLATFORM_WAIT进入时刻
 
         # —— 舵机串口 (抛投机构) ——
@@ -231,9 +212,8 @@ class TFTrackingNode(Node):
         # ====== 定时器 (20Hz) ======
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-        mode_str = "视觉融合" if self.enable_vision_fusion else "纯TF"
         self.get_logger().info(
-            f"TF追踪节点已启动 ({mode_str}) | "
+            "TF追踪节点已启动 | "
             f"map={self.map_frame} | drone={self.drone_frame} | car={self.car_frame} | "
             f"起飞高度={self.takeoff_height}m | 最大距离={self.max_distance}m"
         )
@@ -256,9 +236,6 @@ class TFTrackingNode(Node):
             self.get_logger().info(
                 f'收到小车启动触发信号 → 模式{msg.data}({mode_names.get(msg.data, "未知")}), 无人机将自主起飞'
             )
-
-    def world_coordinates_callback(self, msg: PoseArray) -> None:
-        self._latest_detections = msg
 
     # ==================== 舵机控制 (抛投机构) ====================
 
@@ -338,27 +315,11 @@ class TFTrackingNode(Node):
 
         return (ned_x, ned_y)
 
-    # ==================== 坐标转换 (视觉融合) ====================
-
-    @staticmethod
-    def _world_pose_to_ned(pose: Pose):
-        """
-        将 detection_world_node.py 发布的坐标转为 NED。
-        detection_world_node.py 编码:
-          pose.x = world_north,  pose.y = -world_east
-        逆变换:
-          ned_north = pose.x,  ned_east = -pose.y
-        """
-        return (pose.position.x, -pose.position.y)
-
     # ==================== 目标获取 ====================
 
     def _get_target_ned(self):
         """
-        获取追踪目标 NED 坐标。
-
-        TF 查询 + 视觉矫正: YOLO识别→矫正car_offset(EMA平滑), 让TF追踪越来越准
-        不再用识别值替代TF, 而是持续修正偏移量。
+        获取追踪目标 NED 坐标 (纯TF, 无视觉矫正)。
 
         返回 (ned_x, ned_y, distance) 或 None
         """
@@ -377,44 +338,7 @@ class TFTrackingNode(Node):
         if dist > self.max_distance:
             return None
 
-        # —— 视觉矫正 car_offset (EMA平滑, 让TF越来越准) ——
-        # TF与YOLO一致(≤0.2m)时: offset += alpha * (yolo - tf)
-        # NED→FLU: x方向相同, y方向取反 (ned_east→ros_west)
-        if self.enable_vision_fusion and self._latest_detections is not None:
-            yolo_target = self._match_vision_to_car(car)
-            if yolo_target is not None:
-                yolo_x, yolo_y = yolo_target
-                err_x = yolo_x - car[0]         # NED north 误差
-                err_y = -(yolo_y - car[1])       # NED east→FLU west (取反)
-                a = self.offset_correction_alpha
-                self.car_offset_x += a * err_x
-                self.car_offset_y += a * err_y
-                d_err = math.hypot(err_x, yolo_y - car[1])
-                self.get_logger().info(
-                    f'视觉矫正: err={d_err:.3f}m offset=({self.car_offset_x:.3f}, {self.car_offset_y:.3f})',
-                    throttle_duration_sec=2.0)
-
         return (car[0], car[1], dist)
-
-    def _match_vision_to_car(self, car_ned):
-        """从 YOLO 检测中找离小车 TF 位置最近的目标。返回 (ned_x, ned_y) 或 None"""
-        if self._latest_detections is None:
-            return None
-        poses = self._latest_detections.poses
-        if not poses:
-            return None
-
-        best = None
-        best_dist = self.vision_match_threshold
-
-        for pose in poses:
-            ned_x, ned_y = self._world_pose_to_ned(pose)
-            d = math.hypot(ned_x - car_ned[0], ned_y - car_ned[1])
-            if d < best_dist:
-                best_dist = d
-                best = (ned_x, ned_y)
-
-        return best
 
     # ==================== 发布 ====================
 
@@ -550,6 +474,7 @@ class TFTrackingNode(Node):
                     self._land_stage2 = 0
                     self._land_stage2_time = None
                     self._land_complete_sent = False
+                    self._land_arrive_time = None
                     self.state = FlightState.TRACK
                 else:
                     self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
@@ -635,22 +560,27 @@ class TFTrackingNode(Node):
                                 self._land_stage2 = 2
                         else:
                             track_z = 0.0
-                            self.get_logger().info(
-                                f'[模式2 降落] 阶段2: 降0cm中 Z={self.vehicle_local_position.z:.2f}',
-                                throttle_duration_sec=1.0)
-                            if abs(self.vehicle_local_position.z) < 0.05 and not self._land_complete_sent:
+                            if abs(self.vehicle_local_position.z) < 0.05:
+                                if self._land_arrive_time is None:
+                                    self._land_arrive_time = self.get_clock().now()
+                                elapsed = (self.get_clock().now() - self._land_arrive_time).nanoseconds * 1e-9
                                 self.get_logger().info(
-                                    f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
-                                msg = Int32(); msg.data = 1
-                                self.land_complete_pub.publish(msg)  # 通知小车减速
-                                self._land_complete_sent = True
-                                self._platform_enter_time = self.get_clock().now()
-                                self.state = FlightState.PLATFORM_WAIT
-                                return
+                                    f'[模式2 降落] 阶段2: 已落车, 等待 {elapsed:.1f}s/2.0s 发话题...',
+                                    throttle_duration_sec=1.0)
+                                if elapsed >= 2.0 and not self._land_complete_sent:
+                                    self.get_logger().info(
+                                        f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
+                                    msg = Int32(); msg.data = 1
+                                    self.land_complete_pub.publish(msg)
+                                    self._land_complete_sent = True
+                                    self._platform_enter_time = self.get_clock().now()
+                                    self.state = FlightState.PLATFORM_WAIT
+                                    return
                     else:
                         track_z = base_z
                         self._land_stage2 = 0
                         self._land_stage2_time = None
+                        self._land_arrive_time = None
                 else:
                     track_z = base_z
 
