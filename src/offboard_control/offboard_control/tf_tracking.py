@@ -455,15 +455,18 @@ class TFTrackingNode(Node):
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
                 self.get_logger().info("TAKEOFF → TRACKLAND")
                 self.state = FS_M2.TRACKLAND
-                self.target_z = self.takeoff_height + 0.2
+                self.target_z = self.takeoff_height
 
         elif self.state == FS_M2.TRACKLAND:
             target = self._get_target_ned()
             self.set_target_position(target[0], target[1], self.target_z)
             if self.check_arrived_2d(target[0], target[1]):
-                self.get_logger().info("DOWN !!")
-                if self.vehicle_local_position.z < 0.01:   # 尚未触地
-                    self.target_z += 0.2                  # 下降 (NED 中值增大)
+                if self.vehicle_local_position.z < -0.05:   # 尚未接近车顶
+                    # 以 0.3m/s 缓慢下降, 上限 -0.05 防触发 offboard_control land
+                    self.target_z = min(-0.05, self.target_z + 0.015)
+                    self.get_logger().info(
+                        f'[TRACKLAND] 下降中 target_z={self.target_z:.3f}',
+                        throttle_duration_sec=1.0)
                 else:
                     self.get_logger().info("TRACKLAND → FLIGHT_AGINE")
                     self.state = FS_M2.FLIGHT_AGINE

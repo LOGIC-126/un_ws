@@ -119,6 +119,8 @@ class Land_Control(Node):
 
         self.has_target_altitude = False
         self.arm_time = None  # disarm 计时器 (offboard 掉线3s后 disarm)
+        self._auto_takeoff_attempt_time = None  # 自动起飞冷却计时 (防刷屏)
+        self._land_triggered = False  # 已触发 land, 抑制 offboard heartbeat
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
         self.last_velocity_time = self.get_clock().now()
@@ -251,6 +253,7 @@ class Land_Control(Node):
         self.get_logger().info("Switching to offboard mode")
 
     def land(self):
+        self._land_triggered = True
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self.get_logger().info("Switching to land mode")
 
@@ -328,8 +331,9 @@ class Land_Control(Node):
         self.filtered_vz = self.vehicle_local_position.vz if hasattr(self.vehicle_local_position, 'vz') else 0.0
         self.filtered_yawspeed = 0.0
 
-        # 同时重置起飞 PID
+        # 同时重置起飞 PID 与 land 标记
         self._reset_takeoff_pid()
+        self._land_triggered = False
 
     @staticmethod
     def _yaw_error_wrap(target: float, current: float) -> float:
@@ -460,7 +464,8 @@ class Land_Control(Node):
             (now - self.last_velocity_time).nanoseconds * 1e-9 < self.velocity_timeout
         )
 
-        self.publish_offboard_control_heartbeat_signal()
+        if not self._land_triggered:
+            self.publish_offboard_control_heartbeat_signal()
 
         mode_label = 'Vel-PID' if self.control_mode == 'velocity_pid' else 'Pos'
         cmd_label = 'DirectVel' if velocity_active else mode_label
@@ -493,13 +498,23 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                self.get_logger().info(
-                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
-                    throttle_duration_sec=3.0)
-                self._reset_pid()
-                self._in_takeoff_phase = True
-                self.engage_offboard_mode()
-                self.arm()
+                now = self.get_clock().now()
+                # 5s 冷却防刷屏, 避免每帧 spam PX4
+                if self._auto_takeoff_attempt_time is None or \
+                   (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9 > 5.0:
+                    self._auto_takeoff_attempt_time = now
+                    self.get_logger().info(
+                        "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
+                    self._reset_pid()
+                    self._in_takeoff_phase = True
+                # 3s 窗口: 先切 offboard, 等确认后再 arm
+                if self._auto_takeoff_attempt_time is not None:
+                    elapsed = (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9
+                    if elapsed < 3.0:
+                        if not in_offboard:
+                            self.engage_offboard_mode()
+                        else:
+                            self.arm()
             # 必须持续发 setpoint, PX4 才会接受 offboard 切换
             self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
@@ -610,11 +625,19 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                self.get_logger().info(
-                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
-                    throttle_duration_sec=3.0)
-                self.engage_offboard_mode()
-                self.arm()
+                now = self.get_clock().now()
+                if self._auto_takeoff_attempt_time is None or \
+                   (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9 > 5.0:
+                    self._auto_takeoff_attempt_time = now
+                    self.get_logger().info(
+                        "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
+                if self._auto_takeoff_attempt_time is not None:
+                    elapsed = (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9
+                    if elapsed < 3.0:
+                        if not in_offboard:
+                            self.engage_offboard_mode()
+                        else:
+                            self.arm()
 
         elif in_offboard:
             self.arm_time = None  # offboard 已建立，清除计时
