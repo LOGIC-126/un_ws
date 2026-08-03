@@ -27,7 +27,7 @@ ros2 run offboard_control node_offboard_control --ros-args --params-file install
 sleep 5
 
 echo "start node_tf_tracking"
-ros2 run offboard_control node_tf_tracking --ros-args     -p car.offset_x:=0.60     -p car.offset_y:=-0.38 &
+ros2 run offboard_control node_tf_tracking --ros-args     -p car.offset_x:=0.56     -p car.offset_y:=-0.39 &
 sleep 5
 
 # 等待任意后台进程退出，然后清理所有

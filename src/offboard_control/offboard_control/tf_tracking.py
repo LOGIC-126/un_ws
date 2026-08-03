@@ -43,11 +43,8 @@ class FlightState(Enum):
 
 class FS_M2(Enum):
     TAKEOFF = 0
-    TRACKLAND = 1
-    FLIGHT_AGINE = 2
-    LEAVE_CAR = 3
-    RTH = 4
-    LAND = 5
+    TRACKLOW = 1     # 低空跟踪小车 (固定低高度, 跟上小车速度)
+    LANDING = 2      # 快速降落 (继续跟踪XY, Z推0触发land)
 
 
 class TFTrackingNode(Node):
@@ -462,9 +459,10 @@ class TFTrackingNode(Node):
             self.set_target_position(target[0], target[1], self.target_z)
             if self.check_arrived_2d(target[0], target[1]):
                 self.get_logger().info("DOWN !!")
-                if self.vehicle_local_position.z < 0.01:   # 尚未触地
-                    self.target_z += 0.2                  # 下降 (NED 中值增大)
-                else:
+                if self.vehicle_local_position.z < -0.10:   # 贴近飞行
+                    self.target_z = -0.10                  # 下降 
+                else:                                       # 触地
+                    self.target_z = 0.02                     # 触地
                     self.get_logger().info("TRACKLAND → FLIGHT_AGINE")
                     self.state = FS_M2.FLIGHT_AGINE
                     self.target_z = self.takeoff_height
