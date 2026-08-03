@@ -43,8 +43,12 @@ class FlightState(Enum):
 
 class FS_M2(Enum):
     TAKEOFF = 0
-    TRACKLOW = 1     # 低空跟踪小车 (固定低高度, 跟上小车速度)
-    LANDING = 2      # 快速降落 (继续跟踪XY, Z推0触发land)
+    TRACKLAND = 1
+    FLIGHT_AGINE = 2
+    LEAVE_CAR = 3
+    RTH = 4
+    LAND = 5
+
 
 
 class TFTrackingNode(Node):
