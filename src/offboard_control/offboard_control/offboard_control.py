@@ -18,7 +18,7 @@ from px4_msgs.msg import (
     TrajectorySetpoint,
     VehicleCommand,
     VehicleLocalPosition,
-    VehicleStatus,
+    VehicleControlMode,
     BatteryStatus,
     VehicleLandDetected
 )
@@ -28,9 +28,6 @@ class Land_Control(Node):
 
     def __init__(self) -> None:
         super().__init__('offboard_control_takeoff_and_land')
-
-        # 可配置参数: vehicle_status 话题后缀 (v2=真机旧版PX4, v4=SITL 1.18+)
-        self.declare_parameter('vehicle_status_suffix', 'v2')
 
         # 控制模式: "position" (PX4内部位置控制) / "velocity_pid" (机载PID→速度)
         self.declare_parameter('control_mode', 'velocity_pid')
@@ -94,10 +91,9 @@ class Land_Control(Node):
         self.vehicle_local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, qos_profile)
-        self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus,
-            f'/fmu/out/vehicle_status_{self.get_parameter("vehicle_status_suffix").value}',
-            self.vehicle_status_callback, qos_profile)
+        self.vehicle_control_mode_subscriber = self.create_subscription(
+            VehicleControlMode, '/fmu/out/vehicle_control_mode',
+            self.vehicle_control_mode_callback, qos_profile)
         self.battery_status_subscriber = self.create_subscription(
             BatteryStatus, '/fmu/out/battery_status_v1',
             self.battery_status_callback, qos_profile)
@@ -113,7 +109,7 @@ class Land_Control(Node):
         # Initialize variables
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
-        self.vehicle_status = VehicleStatus()
+        self.vehicle_control_mode = VehicleControlMode()
         self.battery_status = BatteryStatus()
         self.vehicle_land_detected = VehicleLandDetected()
 
@@ -206,8 +202,8 @@ class Land_Control(Node):
     def vehicle_local_position_callback(self, vehicle_local_position):
         self.vehicle_local_position = vehicle_local_position
 
-    def vehicle_status_callback(self, vehicle_status):
-        self.vehicle_status = vehicle_status
+    def vehicle_control_mode_callback(self, vehicle_control_mode):
+        self.vehicle_control_mode = vehicle_control_mode
 
     def battery_status_callback(self, battery_status):
         self.battery_status = battery_status
@@ -455,8 +451,8 @@ class Land_Control(Node):
     def timer_callback(self) -> None:
         battery_percent = self.battery_status.remaining * 100.0
         is_landed = self.vehicle_land_detected.landed
-        is_armed = self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED
-        in_offboard = self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
+        is_armed = self.vehicle_control_mode.flag_armed
+        in_offboard = self.vehicle_control_mode.flag_control_offboard_enabled
 
         now = self.get_clock().now()
         velocity_active = (
@@ -471,7 +467,7 @@ class Land_Control(Node):
         self.get_logger().info(
             f"--- UAV STATUS --- "
             f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
-            f"Nav: {self.vehicle_status.nav_state} | "
+            f"Armed: {is_armed} | Offboard: {in_offboard} | "
             f"Ctrl: {cmd_label}",
             throttle_duration_sec=2.0,
         )
