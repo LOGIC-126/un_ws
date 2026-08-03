@@ -18,7 +18,7 @@ from px4_msgs.msg import (
     TrajectorySetpoint,
     VehicleCommand,
     VehicleLocalPosition,
-    VehicleControlMode,
+    VehicleStatus,
     BatteryStatus,
     VehicleLandDetected
 )
@@ -28,6 +28,9 @@ class Land_Control(Node):
 
     def __init__(self) -> None:
         super().__init__('offboard_control_takeoff_and_land')
+
+        # 可配置参数: vehicle_status 话题后缀 (v2=真机旧版PX4, v4=SITL 1.18+)
+        self.declare_parameter('vehicle_status_suffix', 'v2')
 
         # 控制模式: "position" (PX4内部位置控制) / "velocity_pid" (机载PID→速度)
         self.declare_parameter('control_mode', 'velocity_pid')
@@ -91,9 +94,10 @@ class Land_Control(Node):
         self.vehicle_local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
             self.vehicle_local_position_callback, qos_profile)
-        self.vehicle_control_mode_subscriber = self.create_subscription(
-            VehicleControlMode, '/fmu/out/vehicle_control_mode',
-            self.vehicle_control_mode_callback, qos_profile)
+        self.vehicle_status_subscriber = self.create_subscription(
+            VehicleStatus,
+            f'/fmu/out/vehicle_status_{self.get_parameter("vehicle_status_suffix").value}',
+            self.vehicle_status_callback, qos_profile)
         self.battery_status_subscriber = self.create_subscription(
             BatteryStatus, '/fmu/out/battery_status_v1',
             self.battery_status_callback, qos_profile)
@@ -109,7 +113,7 @@ class Land_Control(Node):
         # Initialize variables
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
-        self.vehicle_control_mode = VehicleControlMode()
+        self.vehicle_status = VehicleStatus()
         self.battery_status = BatteryStatus()
         self.vehicle_land_detected = VehicleLandDetected()
 
@@ -119,8 +123,6 @@ class Land_Control(Node):
 
         self.has_target_altitude = False
         self.arm_time = None  # disarm 计时器 (offboard 掉线3s后 disarm)
-        self._auto_takeoff_attempt_time = None  # 自动起飞冷却计时 (防刷屏)
-        self._land_triggered = False  # 已触发 land, 抑制 offboard heartbeat
         # —— 速度控制状态 ——
         self.target_velocity = Twist()
         self.last_velocity_time = self.get_clock().now()
@@ -204,8 +206,8 @@ class Land_Control(Node):
     def vehicle_local_position_callback(self, vehicle_local_position):
         self.vehicle_local_position = vehicle_local_position
 
-    def vehicle_control_mode_callback(self, vehicle_control_mode):
-        self.vehicle_control_mode = vehicle_control_mode
+    def vehicle_status_callback(self, vehicle_status):
+        self.vehicle_status = vehicle_status
 
     def battery_status_callback(self, battery_status):
         self.battery_status = battery_status
@@ -253,7 +255,6 @@ class Land_Control(Node):
         self.get_logger().info("Switching to offboard mode")
 
     def land(self):
-        self._land_triggered = True
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self.get_logger().info("Switching to land mode")
 
@@ -331,9 +332,8 @@ class Land_Control(Node):
         self.filtered_vz = self.vehicle_local_position.vz if hasattr(self.vehicle_local_position, 'vz') else 0.0
         self.filtered_yawspeed = 0.0
 
-        # 同时重置起飞 PID 与 land 标记
+        # 同时重置起飞 PID
         self._reset_takeoff_pid()
-        self._land_triggered = False
 
     @staticmethod
     def _yaw_error_wrap(target: float, current: float) -> float:
@@ -455,8 +455,8 @@ class Land_Control(Node):
     def timer_callback(self) -> None:
         battery_percent = self.battery_status.remaining * 100.0
         is_landed = self.vehicle_land_detected.landed
-        is_armed = self.vehicle_control_mode.flag_armed
-        in_offboard = self.vehicle_control_mode.flag_control_offboard_enabled
+        is_armed = self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED
+        in_offboard = self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
 
         now = self.get_clock().now()
         velocity_active = (
@@ -464,15 +464,14 @@ class Land_Control(Node):
             (now - self.last_velocity_time).nanoseconds * 1e-9 < self.velocity_timeout
         )
 
-        if not self._land_triggered:
-            self.publish_offboard_control_heartbeat_signal()
+        self.publish_offboard_control_heartbeat_signal()
 
         mode_label = 'Vel-PID' if self.control_mode == 'velocity_pid' else 'Pos'
         cmd_label = 'DirectVel' if velocity_active else mode_label
         self.get_logger().info(
             f"--- UAV STATUS --- "
             f"Pos: [X: {self.vehicle_local_position.x:.2f}, Y: {self.vehicle_local_position.y:.2f}, Z: {self.vehicle_local_position.z:.2f}] | "
-            f"Armed: {is_armed} | Offboard: {in_offboard} | "
+            f"Nav: {self.vehicle_status.nav_state} | "
             f"Ctrl: {cmd_label}",
             throttle_duration_sec=2.0,
         )
@@ -498,23 +497,13 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                now = self.get_clock().now()
-                # 5s 冷却防刷屏, 避免每帧 spam PX4
-                if self._auto_takeoff_attempt_time is None or \
-                   (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9 > 5.0:
-                    self._auto_takeoff_attempt_time = now
-                    self.get_logger().info(
-                        "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
-                    self._reset_pid()
-                    self._in_takeoff_phase = True
-                # 3s 窗口: 先切 offboard, 等确认后再 arm
-                if self._auto_takeoff_attempt_time is not None:
-                    elapsed = (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9
-                    if elapsed < 3.0:
-                        if not in_offboard:
-                            self.engage_offboard_mode()
-                        else:
-                            self.arm()
+                self.get_logger().info(
+                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
+                    throttle_duration_sec=3.0)
+                self._reset_pid()
+                self._in_takeoff_phase = True
+                self.engage_offboard_mode()
+                self.arm()
             # 必须持续发 setpoint, PX4 才会接受 offboard 切换
             self.publish_velocity_setpoint(0.0, 0.0, 0.0, 0.0)
 
@@ -625,19 +614,11 @@ class Land_Control(Node):
 
         if is_landed and not is_armed:
             if self.has_target_altitude and abs(tar_z) > 0.1:
-                now = self.get_clock().now()
-                if self._auto_takeoff_attempt_time is None or \
-                   (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9 > 5.0:
-                    self._auto_takeoff_attempt_time = now
-                    self.get_logger().info(
-                        "Ground & Disarmed. Valid altitude → Auto-Takeoff...")
-                if self._auto_takeoff_attempt_time is not None:
-                    elapsed = (now - self._auto_takeoff_attempt_time).nanoseconds * 1e-9
-                    if elapsed < 3.0:
-                        if not in_offboard:
-                            self.engage_offboard_mode()
-                        else:
-                            self.arm()
+                self.get_logger().info(
+                    "Ground & Disarmed. Valid altitude → Auto-Takeoff...",
+                    throttle_duration_sec=3.0)
+                self.engage_offboard_mode()
+                self.arm()
 
         elif in_offboard:
             self.arm_time = None  # offboard 已建立，清除计时
