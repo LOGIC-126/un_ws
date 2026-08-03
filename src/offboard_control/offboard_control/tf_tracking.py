@@ -2,24 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-TF 小车追踪节点 (仿写 yolo_tracking.py, 参考 ekf2_link_dds.py TF 监听模式)
+TF 小车追踪节点 (仅保留模式1：跟踪抛投，模式2接口保留但已禁用)
 
 通过 TF2 监听小车 map→car_base_link 变换，计算小车相对无人机的 NED 偏移，
-驱动无人机追踪小车。
-
-坐标系 (与 ekf2_link_dds.py 完全一致):
-  ROS map (Cartographer): x=北, y=西, z=上, yaw=CCW+
-  PX4 NED:               x=北, y=东, z=下, yaw=CW+
-  转换: ned_x=ros_x, ned_y=-ros_y, ned_z=-ros_z, ned_yaw=-ros_yaw
-
-相对定位法:
-  1. TF 查询 map→base_link (无人机 map 位姿)
-  2. TF 查询 map→car_frame  (小车 map 位姿)
-  3. delta = car_map - drone_map   (ROS FLU 相对偏移)
-  4. ned_delta = (delta.x, -delta.y)  → NED 偏移
-  5. target_ned = drone_ned + ned_delta  → 目标 NED
-
-可选融合 YOLO 视觉检测, 提高追踪鲁棒性。
+驱动无人机追踪小车并执行抛投。
 
 状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND → DONE (全自动, 无需RC)
 """
@@ -50,19 +36,19 @@ class FlightState(Enum):
     TRACK = 3
     LOST = 4
     DROP = 5
-    RTH = 6          # Return To Home 返航 (模式1)
-    LAND = 7         # 降落 (模式1)
+    RTH = 6          # Return To Home 返航
+    LAND = 7         # 降落
     DONE = 8         # 任务完成
-    PLATFORM_WAIT = 9 # 模式2: 落车后等待5s→返航
+    # 模式2状态已剔除：PLATFORM_WAIT, DEPART
 
 
 class TFTrackingNode(Node):
-    """TF 小车追踪节点: TF2 监听 + 状态机驱动, 追踪小车"""
+    """TF 小车追踪节点: TF2 监听 + 状态机驱动, 追踪小车（仅模式1）"""
 
     def __init__(self):
         super().__init__('tf_tracking_node')
 
-        # ====== 参数声明 (可通过命令行 --ros-args -p 覆盖) ======
+        # ====== 参数声明 (仅模式1相关) ======
         self.declare_parameter('takeoff_height', -1.2)
         self.declare_parameter('arrival_threshold', 0.3)
         self.declare_parameter('confirm_frames', 3)
@@ -74,23 +60,19 @@ class TFTrackingNode(Node):
         # —— TF 帧配置 ——
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('drone_frame', 'base_link')
-        self.declare_parameter('car_frame', 'base_footprint')  # 小车 frame (通常 base_footprint)
+        self.declare_parameter('car_frame', 'base_footprint')
 
-        # —— 小车 odom→map 偏移 (与 ekf2_link_dds.py 一致) ——
-        self.declare_parameter('car.offset_x', 0.6)   # odom→map X偏移(前+)
-        self.declare_parameter('car.offset_y', -0.36)  # odom→map Y偏移(左+右-)
+        # —— 小车 odom→map 偏移 ——
+        self.declare_parameter('car.offset_x', 0.6)
+        self.declare_parameter('car.offset_y', -0.36)
 
         # —— 追踪参数 ——
         self.declare_parameter('max_distance', 15.0)
-        self.declare_parameter('close_descent', 0.25)   # 靠近小车时逐渐降落高度 NED (m)
-        self.declare_parameter('rth_offset_x', -0.15)   # 返航点X偏移 NED (往后退, m)
-        self.declare_parameter('rth_offset_y', 0.0)     # 返航点Y偏移 NED (m)
-        self.declare_parameter('mode2_land_x', 3.125)   # 模式2降落点X NED (前312.5cm, m)
-        self.declare_parameter('mode2_land_y', 1.125)   # 模式2降落点Y NED (右112.5cm, m)
+        self.declare_parameter('close_descent', 0.25)
 
-        # —— 模式2 追踪降落 (参考模式1 DROP: 追上后直接设目标Z, PID自然下降) ——
-        self.declare_parameter('dynamic_land_height', -0.1)      # 降落目标高度 NED (10cm)
-        self.declare_parameter('platform_wait_time', 5.0)        # 落车后等待时间 (s)
+        # 模式1 返航/降落点
+        self.declare_parameter('rth_offset_x', -0.15)
+        self.declare_parameter('rth_offset_y', 0.0)
 
         # 读取参数值
         self.takeoff_height = self.get_parameter('takeoff_height').value
@@ -103,13 +85,10 @@ class TFTrackingNode(Node):
         self.close_descent = self.get_parameter('close_descent').value
         self.rth_offset_x = self.get_parameter('rth_offset_x').value
         self.rth_offset_y = self.get_parameter('rth_offset_y').value
-        self.mode2_land_x = self.get_parameter('mode2_land_x').value
-        self.mode2_land_y = self.get_parameter('mode2_land_y').value
-        self.dynamic_land_height = self.get_parameter('dynamic_land_height').value
-        self.platform_wait_time = self.get_parameter('platform_wait_time').value
-        self.drop_height = -0.5   # 抛投高度 NED (0.5m, 明显低于追踪高度)
-        self.rth_delay = 5.0     # 抛投完成后等待时间 (s), 然后返航
-        self.land_low_height = -0.3  # 降落过渡高度 NED (30cm, 先PID慢降到此再触发land)
+
+        self.drop_height = -0.5
+        self.rth_delay = 5.0
+        self.land_low_height = -0.3
 
         self.map_frame = self.get_parameter('map_frame').value
         self.drone_frame = self.get_parameter('drone_frame').value
@@ -118,9 +97,8 @@ class TFTrackingNode(Node):
         self.car_offset_y = self.get_parameter('car.offset_y').value
         self.max_distance = self.get_parameter('max_distance').value
 
-        # ====== TF2 监听器 (多话题: /tf + /car/tf, 参考 waypoint_tracker) ======
+        # ====== TF2 监听器 ======
         self.tf_buffer = tf2_ros.Buffer()
-        # 手动订阅所有 TF 源，统一塞进 Buffer
         for topic in ('/tf', '/tf_static', '/car/tf', '/car/tf_static'):
             self.create_subscription(
                 TFMessage, topic,
@@ -141,10 +119,8 @@ class TFTrackingNode(Node):
             Pose, '/uav/target_position', qos_profile)
         self.drop_complete_pub = self.create_publisher(
             Int32, '/car/drop_complete', 10)
-        self.land_complete_pub = self.create_publisher(
-            Int32, '/car/land_complete', 10)  # 模式2降落完成→小车减速
         self.car_resume_pub = self.create_publisher(
-            Int32, '/car/resume', 10)         # 模式2起飞完成→小车恢复速度
+            Int32, '/car/resume', 10)         # 模式1 状态→小车
 
         # ====== 订阅器 ======
         self.vehicle_local_pos_sub = self.create_subscription(
@@ -154,8 +130,6 @@ class TFTrackingNode(Node):
             VehicleStatus, '/fmu/out/vehicle_status_v2',
             self.vehicle_status_callback, qos_profile)
 
-        # —— 小车启动触发 (waypoint_tracker 行驶≥0.5m 后发布) ——
-        # _car_mode: 0=未触发, 1=模式1(跟踪抛投), 2=模式2(跟踪起降, 当前仅追踪)
         self._car_mode = 0
         self.car_trigger_sub = self.create_subscription(
             Int32, '/car/trigger', self._car_trigger_callback, 10)
@@ -163,39 +137,21 @@ class TFTrackingNode(Node):
         # ====== 状态变量 ======
         self.vehicle_status = VehicleStatus()
         self.vehicle_local_position = VehicleLocalPosition()
-
         self.state = FlightState.INIT
-
-        # 小车位姿缓存 (无人机 NED 坐标系)
-        self._car_ned = None             # (ned_x, ned_y) or None
-
-        # 目标确认计数器
+        self._car_ned = None
         self._car_detection_count = 0
-
-        # 锁定目标 (NED: x=北, y=东)
         self._locked_target = None
-
-        # 丢失计时
         self._lost_start_time = None
         self._search_start_time = None
-
-        # 起飞后悬停计时
         self._wait_start_time = None
-
-        # 抛投计时
         self._drop_start_time = None
-        self._drop_enter_time = None   # 进入DROP状态的时刻
-        self._drop_servo_done = False  # 抛投舵机动作只执行一次
-        self._land_stage = 0           # 降落阶段: 0=PID慢降, 1=触发PX4 land
+        self._drop_enter_time = None
+        self._drop_servo_done = False
+        self._land_stage = 0
 
-        # 模式2 追踪降落 (两段式: 先降10cm→等1s→降0cm落平台)
-        self._land_stage2 = 0              # 0=降10cm, 1=等1s, 2=降0cm
-        self._land_stage2_time = None      # 阶段计时
-        self._land_complete_sent = False   # 降落完成话题已发送
-        self._land_arrive_time = None      # 落地到车时刻, 等2s后发话题
-        self._platform_enter_time = None   # PLATFORM_WAIT进入时刻
+        self._car_resume_sent = False
 
-        # —— 舵机串口 (抛投机构) ——
+        # 舵机
         self.servo_serial = None
         try:
             self.servo_serial = serial.Serial('/dev/ttyS0', 115200, timeout=0.1)
@@ -203,150 +159,84 @@ class TFTrackingNode(Node):
         except serial.SerialException as e:
             self.get_logger().warn(f'舵机串口打开失败: {e}')
 
-        # 悬停位置
         self._hover_x = 0.0
         self._hover_y = 0.0
-
-        # 目标缓存
         self.target_x = 0.0
         self.target_y = 0.0
         self.target_z = 0.0
         self.target_yaw = 0.0
 
-        # ====== 定时器 (20Hz) ======
         self.timer = self.create_timer(0.05, self.timer_callback)
-
         self.get_logger().info(
-            "TF追踪节点已启动 | "
+            "TF追踪节点已启动 | 仅支持模式1（跟踪抛投）| "
             f"map={self.map_frame} | drone={self.drone_frame} | car={self.car_frame} | "
             f"起飞高度={self.takeoff_height}m | 最大距离={self.max_distance}m"
         )
 
     # ==================== 订阅回调 ====================
+    def vehicle_local_position_callback(self, msg): self.vehicle_local_position = msg
+    def vehicle_status_callback(self, msg): self.vehicle_status = msg
 
-    def vehicle_local_position_callback(self, msg: VehicleLocalPosition) -> None:
-        self.vehicle_local_position = msg
+    def _car_trigger_callback(self, msg):
+        if msg.data == 1 and self._car_mode == 0:
+            self._car_mode = 1
+            self.get_logger().info('收到小车触发 → 模式1（跟踪抛投）')
+        elif msg.data == 2:
+            self.get_logger().warn('收到模式2触发指令，但当前固件已禁用模式2，忽略')
 
-    def vehicle_status_callback(self, msg: VehicleStatus) -> None:
-        self.vehicle_status = msg
-
-    def _car_trigger_callback(self, msg: Int32) -> None:
-        """接收小车 waypoint_tracker 的启动信号 (行驶≥0.5m 后触发)
-        msg.data: 1=模式1(跟踪抛投), 2=模式2(跟踪起降-当前仅追踪)
-        """
-        if msg.data in (1, 2) and self._car_mode == 0:
-            self._car_mode = msg.data
-            mode_names = {1: '跟踪抛投', 2: '跟踪起降'}
-            self.get_logger().info(
-                f'收到小车启动触发信号 → 模式{msg.data}({mode_names.get(msg.data, "未知")}), 无人机将自主起飞'
-            )
-
-    # ==================== 舵机控制 (抛投机构) ====================
-
-    def _servo_cmd(self, data: bytes):
-        """发送舵机指令"""
-        if self.servo_serial is None or not self.servo_serial.is_open:
-            return
+    # ==================== 舵机 ====================
+    def _servo_cmd(self, data):
+        if self.servo_serial is None or not self.servo_serial.is_open: return
         try:
             self.servo_serial.write(data)
-            self.get_logger().info(f'舵机发送: {data.hex(" ").upper()}')
+            self.get_logger().info(f'舵机: {data.hex(" ").upper()}')
         except serial.SerialException as e:
-            self.get_logger().warn(f'舵机发送失败: {e}')
+            self.get_logger().warn(f'舵机失败: {e}')
 
     def _servo_drop(self):
-        """抛投动作: 正向+60° → 反向-60° 抽拉来回"""
         self.get_logger().info('抛投: 正向+60°')
         self._servo_cmd(bytes([0xA5, 0x01, 0xA6]))
         time.sleep(0.5)
         self.get_logger().info('抛投: 反向-60°')
         self._servo_cmd(bytes([0xA5, 0x02, 0xA7]))
         time.sleep(0.5)
-        self.get_logger().info('抛投抽拉完成')
+        self.get_logger().info('抛投完成')
 
-    # ==================== TF 查询 (参考 ekf2_link_dds.py:176-181) ====================
-
+    # ==================== TF → NED ====================
     def _lookup_car_ned(self):
-        """
-        TF 查询小车在 map 帧位置 → 相对偏移 → 无人机 NED 坐标。
-
-        与 ekf2_link_dds.py:222 相同的 FLU→NED 转换:
-          ned_x = ros_x,  ned_y = -ros_y
-
-        小车 odom→map 偏移 (与 ekf2_link_dds.py 一致):
-          car_map = car_tf + (car_offset_x, car_offset_y)
-
-        返回 (ned_x, ned_y) 或 None
-        """
         try:
-            # 1. 查询无人机在 map 帧的位姿
             drone_tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.drone_frame,
-                rclpy.time.Time(),
+                self.map_frame, self.drone_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.05))
             drone_map_x = drone_tf.transform.translation.x
             drone_map_y = drone_tf.transform.translation.y
-
-            # 2. 查询小车在 TF 中的位姿 (odom帧) + odom→map 偏移 = map帧
             car_tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.car_frame,
-                rclpy.time.Time(),
+                self.map_frame, self.car_frame, rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.05))
             car_map_x = car_tf.transform.translation.x + self.car_offset_x
             car_map_y = car_tf.transform.translation.y + self.car_offset_y
-
         except TransformException as e:
-            self.get_logger().warn(
-                f"TF查询失败 ({self.map_frame}→{self.drone_frame} 或 "
-                f"{self.map_frame}→{self.car_frame}): {e}",
-                throttle_duration_sec=3.0)
+            self.get_logger().warn(f"TF查询失败: {e}", throttle_duration_sec=3.0)
             return None
-
-        # 3. 相对偏移 (ROS FLU: x=北, y=西)
-        delta_x = car_map_x - drone_map_x    # 北向差
-        delta_y = car_map_y - drone_map_y    # 西向差
-
-        # 4. FLU → NED (与 ekf2_link_dds.py:222 一致)
-        ned_delta_x = delta_x      # 北→北
-        ned_delta_y = -delta_y     # 西→东 (取反)
-
-        # 5. 无人机当前 NED + 相对偏移 → 小车在无人机 NED 中的位置
+        delta_x = car_map_x - drone_map_x
+        delta_y = car_map_y - drone_map_y
         drone = self.vehicle_local_position
-        if math.isnan(drone.x) or math.isnan(drone.y):
-            return None
-
-        ned_x = drone.x + ned_delta_x
-        ned_y = drone.y + ned_delta_y
-
-        return (ned_x, ned_y)
+        if math.isnan(drone.x) or math.isnan(drone.y): return None
+        return (drone.x + delta_x, drone.y - delta_y)
 
     # ==================== 目标获取 ====================
-
     def _get_target_ned(self):
-        """
-        获取追踪目标 NED 坐标 (纯TF, 无视觉矫正)。
-
-        返回 (ned_x, ned_y, distance) 或 None
-        """
         car = self._lookup_car_ned()
-        if car is None:
-            return None
-
+        if car is None: return None
         drone = self.vehicle_local_position
-        if math.isnan(drone.x) or math.isnan(drone.y):
-            return None
-
-        # 距离检查
-        dx = car[0] - drone.x
-        dy = car[1] - drone.y
+        if math.isnan(drone.x) or math.isnan(drone.y): return None
+        dx = car[0] - drone.x; dy = car[1] - drone.y
         dist = math.hypot(dx, dy)
-        if dist > self.max_distance:
-            return None
-
+        if dist > self.max_distance: return None
         return (car[0], car[1], dist)
 
     # ==================== 发布 ====================
-
-    def publish_target_position(self) -> None:
+    def publish_target_position(self):
         msg = Pose()
         msg.position.x = float(self.target_x)
         msg.position.y = float(self.target_y)
@@ -355,474 +245,224 @@ class TFTrackingNode(Node):
         msg.orientation.z = math.sin(self.target_yaw / 2.0)
         self.target_position_pub.publish(msg)
 
-    def set_target_position(self, x: float, y: float, z: float, yaw: float = 0.0) -> None:
+    def set_target_position(self, x, y, z, yaw=0.0):
         fx, fy, fz, fyaw = float(x), float(y), float(z), float(yaw)
-        if (fx == self.target_x and fy == self.target_y and
-                fz == self.target_z and fyaw == self.target_yaw):
-            return
-        self.target_x = fx
-        self.target_y = fy
-        self.target_z = fz
-        self.target_yaw = fyaw
+        if fx == self.target_x and fy == self.target_y and fz == self.target_z and fyaw == self.target_yaw: return
+        self.target_x, self.target_y, self.target_z, self.target_yaw = fx, fy, fz, fyaw
         self.publish_target_position()
 
-    def check_arrived(self, x: float, y: float, z: float) -> bool:
+    def check_arrived(self, x, y, z):
         pos = self.vehicle_local_position
-        if math.isnan(pos.x) or math.isnan(pos.y) or math.isnan(pos.z):
-            return False
-        dist = math.sqrt((pos.x - x) ** 2 + (pos.y - y) ** 2 + (pos.z - z) ** 2)
-        return dist < self.arrival_threshold
+        if math.isnan(pos.x) or math.isnan(pos.y) or math.isnan(pos.z): return False
+        return math.hypot(pos.x - x, pos.y - y, pos.z - z) < self.arrival_threshold
 
-    # ==================== 状态机辅助 ====================
+    # ==================== 辅助 ====================
+    def _reset_tracking_counters(self):
+        self._car_detection_count = 0; self._lost_start_time = None; self._search_start_time = None
 
-    def _reset_tracking_counters(self) -> None:
-        self._car_detection_count = 0
-        self._lost_start_time = None
-        self._search_start_time = None
-
-    def _record_hover_position(self) -> None:
+    def _record_hover_position(self):
         drone = self.vehicle_local_position
-        if not math.isnan(drone.x) and not math.isnan(drone.y):
-            self._hover_x = drone.x
-            self._hover_y = drone.y
+        if not math.isnan(drone.x) and not math.isnan(drone.y): self._hover_x, self._hover_y = drone.x, drone.y
 
     # ==================== 主循环 ====================
-
-    def timer_callback(self) -> None:
+    def timer_callback(self):
         self.run_state_machine()
-
-        # 状态显示 (每2秒)
         self._print_status()
 
-    def _print_status(self) -> None:
-        """每2秒打印追踪状态"""
+    def _print_status(self):
         now = self.get_clock().now()
-        if not hasattr(self, '_last_log_time'):
-            self._last_log_time = now
-            return
-        if (now - self._last_log_time).nanoseconds * 1e-9 < 2.0:
-            return
+        if not hasattr(self, '_last_log_time'): self._last_log_time = now; return
+        if (now - self._last_log_time).nanoseconds * 1e-9 < 2.0: return
         self._last_log_time = now
-
         drone = self.vehicle_local_position
         state_name = self.state.name
-        car = self._lookup_car_ned()  # 不阻塞, 快速查询
-
+        car = self._lookup_car_ned()
         if car is not None:
-            dx = car[0] - drone.x
-            dy = car[1] - drone.y
-            dist = math.hypot(dx, dy)
-            # 抛投接近提示
+            dx = car[0] - drone.x; dy = car[1] - drone.y; dist = math.hypot(dx, dy)
             drop_hint = ""
             if self.state == FlightState.TRACK and self._drop_start_time is not None:
                 dwell = (now - self._drop_start_time).nanoseconds * 1e-9
-                drop_hint = f" | 抛投倒计时 {dwell:.1f}s/{self.drop_dwell_time}s (阈值{self.drop_distance_threshold}m)"
+                drop_hint = f" | 抛投倒计时 {dwell:.1f}s/{self.drop_dwell_time}s"
             elif self.state == FlightState.DROP:
-                drop_hint = f" | 抛投执行中 Z目标={self.drop_height:.1f}m"
-            elif self.state == FlightState.TRACK and self._car_mode == 2:
-                stages = {0: f'降{abs(self.dynamic_land_height):.1f}m', 1: '悬停1s', 2: '降0cm落平台'}
-                drop_hint = f" | 阶段{self._land_stage2}:{stages.get(self._land_stage2, '?')}"
-            elif self.state == FlightState.PLATFORM_WAIT:
-                if self._platform_enter_time is not None:
-                    e = (now - self._platform_enter_time).nanoseconds * 1e-9
-                    drop_hint = f" | 落车等待 {e:.1f}s→RTH"
+                drop_hint = f" | 抛投执行中 Z={self.drop_height:.1f}m"
             self.get_logger().info(
-                f"[{state_name}] "
-                f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
-                f"小车 NED({car[0]:.2f}, {car[1]:.2f}) | "
-                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f}) | "
-                f"距离={dist:.2f}m{drop_hint}"
-            )
+                f"[{state_name}] 无人机({drone.x:.2f},{drone.y:.2f},{drone.z:.2f}) | "
+                f"小车({car[0]:.2f},{car[1]:.2f}) | 距离={dist:.2f}m{drop_hint}")
         else:
             self.get_logger().info(
-                f"[{state_name}] "
-                f"无人机 NED({drone.x:.2f}, {drone.y:.2f}, {drone.z:.2f}) | "
-                f"小车: 未检测到 | "
-                f"目标 NED({self.target_x:.2f}, {self.target_y:.2f})"
-            )
+                f"[{state_name}] 无人机({drone.x:.2f},{drone.y:.2f},{drone.z:.2f}) | 小车:未检测到")
 
-    def run_state_machine(self) -> None:
-        # ============================
-        # INIT: 地面等待小车 /car/trigger 启动信号
-        # ============================
+    # ==================== 状态机顶层分发 ====================
+    def run_state_machine(self):
+        # 公共状态：INIT（等待触发）
         if self.state == FlightState.INIT:
             self.set_target_position(0.0, 0.0, 0.0)
-
-            if self._car_mode >= 1:
-                mode_names = {1: '跟踪抛投', 2: '跟踪起降'}
-                self.get_logger().info(
-                    f"INIT → TAKEOFF (car trigger, 模式{self._car_mode}:{mode_names.get(self._car_mode, '')})"
-                )
+            if self._car_mode == 1:
+                self.get_logger().info("INIT → TAKEOFF (模式1)")
                 self.set_target_position(0.0, 0.0, self.takeoff_height)
                 self.state = FlightState.TAKEOFF
             else:
-                self.get_logger().info(
-                    "等待小车 /car/trigger 启动信号...",
-                    throttle_duration_sec=3.0,
-                )
+                self.get_logger().info("等待小车 /car/trigger (模式1) ...", throttle_duration_sec=3.0)
 
-        # ============================
-        # TAKEOFF: 爬升至固定高度
-        # ============================
-        elif self.state == FlightState.TAKEOFF:
+        # 公共状态：DONE（任务结束）
+        elif self.state == FlightState.DONE:
+            self._car_mode = 0  # 确保重置
+            self.get_logger().info('[DONE] 等待锁桨...', throttle_duration_sec=3.0)
+            self.set_target_position(self.rth_offset_x, self.rth_offset_y, 0.0)
+
+        # 模式特定状态
+        else:
+            if self._car_mode == 1:
+                self._run_mode1_state_machine()
+            elif self._car_mode == 2:
+                # 模式2接口保留，暂不实现
+                pass
+            else:
+                # 异常情况：模式已清零但状态未归位，强制回 INIT
+                self.get_logger().warn('状态异常：模式为0但状态非INIT/DONE，强制返回INIT')
+                self.state = FlightState.INIT
+
+    # ==================== 模式1 状态机 ====================
+    def _run_mode1_state_machine(self):
+        # TAKEOFF
+        if self.state == FlightState.TAKEOFF:
             self.set_target_position(0.0, 0.0, self.takeoff_height)
-
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
-                if self._car_mode == 2:
-                    # 模式2: 跳过WAIT, 直接追踪 + 追上后PID自然降落 (参考模式1 DROP)
-                    self.get_logger().info(
-                        f"TAKEOFF → TRACK (模式2, 追踪降落, 追上后PID降至{abs(self.dynamic_land_height):.1f}m)")
-                    self._record_hover_position()
-                    self._reset_tracking_counters()
-                    self._locked_target = None
-                    self._land_stage2 = 0
-                    self._land_stage2_time = None
-                    self._land_complete_sent = False
-                    self._land_arrive_time = None
-                    self.state = FlightState.TRACK
-                else:
-                    self.get_logger().info("TAKEOFF → WAIT (到达起飞高度, 悬停2s)")
-                    self._record_hover_position()
-                    self._reset_tracking_counters()
-                    self._locked_target = None
-                    self._wait_start_time = self.get_clock().now()
-                    self.state = FlightState.WAIT
+                self.get_logger().info("TAKEOFF → WAIT (悬停2s)")
+                self._record_hover_position()
+                self._reset_tracking_counters()
+                self._locked_target = None
+                self._wait_start_time = self.get_clock().now()
+                self.car_resume_pub.publish(Int32(data=0))
+                self.state = FlightState.WAIT
 
-        # ============================
-        # WAIT: 悬停5s → 检测到小车即自动追踪
-        # ============================
+        # WAIT
         elif self.state == FlightState.WAIT:
             self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
-
-            # 悬停5秒后再开始检测
             if self._wait_start_time is not None:
                 hover_elapsed = (self.get_clock().now() - self._wait_start_time).nanoseconds * 1e-9
                 if hover_elapsed < 2.0:
-                    self.get_logger().info(
-                        f'[WAIT] 悬停等待 {hover_elapsed:.1f}s/2.0s...',
-                        throttle_duration_sec=1.0)
+                    self.get_logger().info(f'[WAIT] 悬停 {hover_elapsed:.1f}s/2.0s...', throttle_duration_sec=1.0)
                     return
-                else:
-                    self._wait_start_time = None  # 计时完成
-
+                self._wait_start_time = None
             target = self._get_target_ned()
-            if target is not None:
-                self._car_detection_count += 1
-            else:
-                self._car_detection_count = 0
-
+            self._car_detection_count = self._car_detection_count + 1 if target else 0
             if self._car_detection_count >= self.confirm_frames:
                 target = self._get_target_ned()
                 if target is not None:
                     ned_x, ned_y, dist = target
                     self._locked_target = (ned_x, ned_y)
-                    self.get_logger().info(
-                        f"WAIT → TRACK (锁定小车 @ NED({ned_x:.2f}, {ned_y:.2f}), "
-                        f"距离={dist:.2f}m, 确认={self._car_detection_count}帧)"
-                    )
+                    self.get_logger().info(f"WAIT → TRACK (锁定 dist={dist:.2f}m)")
                     self._reset_tracking_counters()
+                    self._car_resume_sent = False
                     self.state = FlightState.TRACK
 
-        # ============================
-        # TRACK: 追踪小车
-        #   模式1: 追踪 + 抛投检测 → DROP
-        #   模式2: 追踪 + 逐渐降落 → 触地通知小车 → DONE
-        # ============================
+        # TRACK
         elif self.state == FlightState.TRACK:
             target = self._get_target_ned()
-
             if target is not None:
                 ned_x, ned_y, dist = target
                 self._locked_target = (ned_x, ned_y)
-
                 if self._lost_start_time is not None:
-                    self.get_logger().info("目标重新出现，继续追踪")
-                    self._lost_start_time = None
+                    self.get_logger().info("目标重新出现"); self._lost_start_time = None
 
-                # 基础追踪高度: 靠近小车时额外降低 close_descent
                 close_ratio = max(0.0, 1.0 - dist / self.drop_distance_threshold)
-                base_z = self.takeoff_height + self.close_descent * close_ratio
-
-                if self._car_mode == 2:
-                    # 模式2 两段式降落: 降10cm→等1s→降0cm落平台
-                    if dist < self.drop_distance_threshold:
-                        if self._land_stage2 == 0:
-                            track_z = self.dynamic_land_height
-                            if abs(self.vehicle_local_position.z - self.dynamic_land_height) < 0.05:
-                                self.get_logger().info(
-                                    f'[模式2 降落] 阶段0→1: 到达10cm Z={self.vehicle_local_position.z:.2f}, 悬停1s')
-                                self._land_stage2 = 1
-                                self._land_stage2_time = self.get_clock().now()
-                        elif self._land_stage2 == 1:
-                            track_z = self.dynamic_land_height
-                            elapsed = (self.get_clock().now() - self._land_stage2_time).nanoseconds * 1e-9
-                            self.get_logger().info(
-                                f'[模式2 降落] 10cm悬停 {elapsed:.1f}s/1.0s...',
-                                throttle_duration_sec=0.5)
-                            if elapsed >= 1.0:
-                                self.get_logger().info('[模式2 降落] 阶段1→2: 悬停完成, 降0cm落平台')
-                                self._land_stage2 = 2
-                        else:
-                            track_z = 0.0
-                            if abs(self.vehicle_local_position.z) < 0.05:
-                                if self._land_arrive_time is None:
-                                    self._land_arrive_time = self.get_clock().now()
-                                elapsed = (self.get_clock().now() - self._land_arrive_time).nanoseconds * 1e-9
-                                self.get_logger().info(
-                                    f'[模式2 降落] 阶段2: 已落车, 等待 {elapsed:.1f}s/3.0s 发话题...',
-                                    throttle_duration_sec=1.0)
-                                if elapsed >= 3.0 and not self._land_complete_sent:
-                                    self.get_logger().info(
-                                        f'[模式2 降落] 完成! 已落平台 Z={self.vehicle_local_position.z:.2f} → 等待{self.platform_wait_time:.0f}s返航')
-                                    msg = Int32(); msg.data = 1
-                                    self.land_complete_pub.publish(msg)
-                                    self._land_complete_sent = True
-                                    self._platform_enter_time = self.get_clock().now()
-                                    self.state = FlightState.PLATFORM_WAIT
-                                    return
-                    else:
-                        track_z = base_z
-                        self._land_stage2 = 0
-                        self._land_stage2_time = None
-                        self._land_arrive_time = None
-                else:
-                    track_z = base_z
-
+                track_z = self.takeoff_height + self.close_descent * close_ratio
                 self.set_target_position(ned_x, ned_y, track_z)
 
-                # 抛投检测 (仅模式1): 接近小车超过 dwell 时间 → DROP
-                if self._car_mode == 1:
-                    if dist < self.drop_distance_threshold:
-                        if self._drop_start_time is None:
-                            self._drop_start_time = self.get_clock().now()
-                        else:
-                            dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
-                            if dwell >= self.drop_dwell_time:
-                                self.get_logger().info(
-                                    f'TRACK → DROP (距小车 {dist:.2f}m, 停留 {dwell:.1f}s)')
-                                self._drop_start_time = None
-                                self._drop_enter_time = self.get_clock().now()
-                                self.state = FlightState.DROP
-                                return
+                # 抛投检测
+                if dist < self.drop_distance_threshold:
+                    if self._drop_start_time is None:
+                        self._drop_start_time = self.get_clock().now()
+                        if not self._car_resume_sent:
+                            self.car_resume_pub.publish(Int32(data=1))
+                            self._car_resume_sent = True
+                            self.get_logger().info(f'模式1 接近小车 dist={dist:.2f}m: 发car_resume=1')
                     else:
-                        self._drop_start_time = None
-
+                        dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
+                        if dwell >= self.drop_dwell_time:
+                            self.get_logger().info(f'TRACK → DROP (dist={dist:.2f}m, dwell={dwell:.1f}s)')
+                            self.car_resume_pub.publish(Int32(data=2))
+                            self._drop_start_time = None
+                            self._drop_enter_time = self.get_clock().now()
+                            self.state = FlightState.DROP; return
+                else:
+                    self._drop_start_time = None
             else:
                 now = self.get_clock().now()
+                if self._lost_start_time is None: self._lost_start_time = now
+                if (now - self._lost_start_time).nanoseconds * 1e-9 >= self.lost_timeout:
+                    self.get_logger().info("TRACK → LOST")
+                    self._reset_tracking_counters(); self._search_start_time = now; self.state = FlightState.LOST
+                elif self._locked_target is not None:
+                    self.set_target_position(*self._locked_target, self.takeoff_height)
 
-                if self._lost_start_time is None:
-                    self._lost_start_time = now
-
-                elapsed = (now - self._lost_start_time).nanoseconds * 1e-9
-
-                if elapsed >= self.lost_timeout:
-                    self.get_logger().info(
-                        f"TRACK → LOST (目标消失 {elapsed:.1f}s > {self.lost_timeout}s)"
-                    )
-                    self._reset_tracking_counters()
-                    self._search_start_time = self.get_clock().now()
-                    self.state = FlightState.LOST
-                else:
-                    if self._locked_target is not None:
-                        lx, ly = self._locked_target
-                        # 模式2丢失时保持追踪高度 (追上后才降)
-                        hold_z = self.dynamic_land_height if self._car_mode == 2 else self.takeoff_height
-                        self.set_target_position(lx, ly, hold_z)
-
-        # ============================
-        # LOST: 最后位置搜索
-        # ============================
+        # LOST
         elif self.state == FlightState.LOST:
             if self._locked_target is not None:
-                lx, ly = self._locked_target
-                # 模式2丢失时保持追踪高度
-                lost_z = self.dynamic_land_height if self._car_mode == 2 else self.takeoff_height
-                self.set_target_position(lx, ly, lost_z)
-
-            target = self._get_target_ned()
-            now = self.get_clock().now()
-
+                self.set_target_position(*self._locked_target, self.takeoff_height)
+            target = self._get_target_ned(); now = self.get_clock().now()
             if target is not None:
                 self._car_detection_count += 1
                 if self._car_detection_count >= self.confirm_frames:
                     ned_x, ned_y, dist = target
-                    elapsed = (now - self._search_start_time).nanoseconds * 1e-9 if self._search_start_time else 0.0
-                    self.get_logger().info(
-                        f"LOST → TRACK (重新锁定 @ NED({ned_x:.2f}, {ned_y:.2f}), "
-                        f"搜索耗时={elapsed:.1f}s)"
-                    )
-                    self._locked_target = (ned_x, ned_y)
-                    self._reset_tracking_counters()
-                    self.state = FlightState.TRACK
-                    return
-            else:
-                self._car_detection_count = 0
+                    self.get_logger().info(f"LOST → TRACK (重新锁定 dist={dist:.2f}m)")
+                    self._locked_target = (ned_x, ned_y); self._reset_tracking_counters()
+                    self.state = FlightState.TRACK; return
+            else: self._car_detection_count = 0
+            if self._search_start_time and (now - self._search_start_time).nanoseconds * 1e-9 >= self.search_timeout:
+                self.get_logger().info("LOST → WAIT")
+                self._record_hover_position(); self._reset_tracking_counters()
+                self._locked_target = None; self.state = FlightState.WAIT
 
-            if self._search_start_time is not None:
-                elapsed = (now - self._search_start_time).nanoseconds * 1e-9
-                if elapsed >= self.search_timeout:
-                    self.get_logger().info(
-                        f"LOST → WAIT (搜索超时 {elapsed:.1f}s > {self.search_timeout}s)"
-                    )
-                    self._record_hover_position()
-                    self._reset_tracking_counters()
-                    self._locked_target = None
-                    self.state = FlightState.WAIT
-
-        # ============================
-        # DROP: 抛投 — 先降高→舵机抽拉→计时→返航
-        # ============================
+        # DROP
         elif self.state == FlightState.DROP:
-            if self._drop_enter_time is None:
-                self._drop_enter_time = self.get_clock().now()
-
-            # 持续追踪小车, 降到抛投高度
+            if self._drop_enter_time is None: self._drop_enter_time = self.get_clock().now()
             target = self._get_target_ned()
             if target is not None:
-                ned_x, ned_y, _ = target
-                self._locked_target = (ned_x, ned_y)
-                self.set_target_position(ned_x, ned_y, self.drop_height)
+                self._locked_target = (target[0], target[1])
+                self.set_target_position(target[0], target[1], self.drop_height)
             elif self._locked_target is not None:
-                lx, ly = self._locked_target
-                self.set_target_position(lx, ly, self.drop_height)
-
-            # 到达抛投高度 → 执行舵机抽拉 (仅一次)
+                self.set_target_position(*self._locked_target, self.drop_height)
             curr_z = self.vehicle_local_position.z
             if not self._drop_servo_done and abs(curr_z - self.drop_height) < 0.2:
                 self._drop_servo_done = True
-                self.get_logger().info(f'到达抛投高度 (Z={curr_z:.2f}m), 执行舵机抽拉')
-                self._servo_drop()
-                # 重置计时器: 从抛投完成开始算 RTH 倒计时
-                self._drop_enter_time = self.get_clock().now()
-
-            # 抛投完成后计时 → 返航
+                self.get_logger().info(f'到达抛投高度 Z={curr_z:.2f}m')
+                self._servo_drop(); self._drop_enter_time = self.get_clock().now()
             if self._drop_servo_done:
                 elapsed = (self.get_clock().now() - self._drop_enter_time).nanoseconds * 1e-9
-                self.get_logger().info(
-                    f'[DROP] 抛投完成, {elapsed:.1f}s/{self.rth_delay}s → RTH',
-                    throttle_duration_sec=1.0)
                 if elapsed >= self.rth_delay:
-                    self.get_logger().info(f'DROP → RTH (抛投完成 {elapsed:.1f}s)')
-                    msg = Int32()
-                    msg.data = 1
-                    self.drop_complete_pub.publish(msg)
-                    self._drop_enter_time = None
-                    self.state = FlightState.RTH
-                    return
+                    self.get_logger().info('DROP → RTH')
+                    self.drop_complete_pub.publish(Int32(data=1))
+                    self._drop_enter_time = None; self.state = FlightState.RTH; return
             else:
-                # 还在降高中
-                self.get_logger().info(
-                    f'[DROP] 降高中 Z={curr_z:.2f}→{self.drop_height:.1f}...',
-                    throttle_duration_sec=1.0)
+                self.get_logger().info(f'[DROP] 降高中 Z={curr_z:.2f}→{self.drop_height:.1f}...', throttle_duration_sec=1.0)
 
-        # ============================
-        # RTH: 返航 — 返回偏移起飞点, 到达后降落
-        # ============================
+        # RTH
         elif self.state == FlightState.RTH:
-            # 持续发送速度信号给小车
-            msg = Int32(); msg.data = 1
-            if self._car_mode == 2:
-                self.car_resume_pub.publish(msg)
-                rth_x = self.mode2_land_x
-                rth_y = self.mode2_land_y
-            else:
-                self.drop_complete_pub.publish(msg)
-                rth_x = self.rth_offset_x
-                rth_y = self.rth_offset_y
-
-            self.get_logger().info(
-                f'[RTH] 返航中, 目标 ({rth_x:.2f}, {rth_y:.2f})',
-                throttle_duration_sec=2.0)
+            rth_x, rth_y = self.rth_offset_x, self.rth_offset_y
+            self.get_logger().info(f'[RTH] 返航 ({rth_x:.2f},{rth_y:.2f})', throttle_duration_sec=2.0)
             self.set_target_position(rth_x, rth_y, self.takeoff_height)
-
             if self.check_arrived(rth_x, rth_y, self.takeoff_height):
-                self.get_logger().info(f'RTH → LAND (到达目标点 ({rth_x:.2f}, {rth_y:.2f}), 开始两段式降落)')
+                self.get_logger().info('RTH → LAND')
+                self.car_resume_pub.publish(Int32(data=3))
                 self._land_stage = 0
                 self.state = FlightState.LAND
 
-        # ============================
-        # LAND: 两段式降落 — PID慢降至低空 → 触发PX4 land
-        # ============================
+        # LAND
         elif self.state == FlightState.LAND:
-            # 持续发送速度信号给小车
-            msg = Int32(); msg.data = 1
-            if self._car_mode == 2:
-                self.car_resume_pub.publish(msg)
-            else:
-                self.drop_complete_pub.publish(msg)
-
-            rth_x = self.rth_offset_x
-            rth_y = self.rth_offset_y
+            land_x, land_y = self.rth_offset_x, self.rth_offset_y
             if self._land_stage == 0:
-                # 阶段0: PID 慢降至过渡高度 (默认 -0.3m = 30cm)
-                self.get_logger().info(
-                    f'[LAND] 阶段0: PID慢降至 {abs(self.land_low_height):.1f}m...',
-                    throttle_duration_sec=2.0)
-                self.set_target_position(rth_x, rth_y, self.land_low_height)
-
-                if self.check_arrived(rth_x, rth_y, self.land_low_height):
-                    self.get_logger().info('LAND 阶段0完成 → 阶段1: 触发 PX4 land')
-                    self._land_stage = 1
+                self.set_target_position(land_x, land_y, self.land_low_height)
+                if self.check_arrived(land_x, land_y, self.land_low_height):
+                    self.get_logger().info('LAND 阶段0→1'); self._land_stage = 1
             else:
-                # 阶段1: Z=0 触发 offboard_control 的 land() → PX4 降落
-                self.get_logger().info(
-                    '[LAND] 阶段1: PX4 降落中...',
-                    throttle_duration_sec=2.0)
-                self.set_target_position(rth_x, rth_y, 0.0)
-
-                # 检测落地: NED z 接近 0 → 切 DONE, 停发目标让 offboard_control disarm
+                self.set_target_position(land_x, land_y, 0.0)
                 if self.vehicle_local_position.z >= -0.15:
-                    self.get_logger().info('LAND → DONE (已着陆, 等待锁桨)')
+                    self.get_logger().info('LAND → DONE')
+                    self.car_resume_pub.publish(Int32(data=5))
+                    self._car_mode = 0   # 重置模式
                     self.state = FlightState.DONE
-
-        # ============================
-        # PLATFORM_WAIT: 模式2 落车后等待→原地爬升→通知小车→RTH
-        # ============================
-        elif self.state == FlightState.PLATFORM_WAIT:
-            if self._platform_enter_time is None:
-                self._platform_enter_time = self.get_clock().now()
-
-            elapsed = (self.get_clock().now() - self._platform_enter_time).nanoseconds * 1e-9
-
-            if elapsed < self.platform_wait_time:
-                # 保持Z=0 (站在车上)
-                self.set_target_position(self._hover_x, self._hover_y, 0.0)
-                self.get_logger().info(
-                    f'[PLATFORM_WAIT] 落车等待 {elapsed:.1f}s/{self.platform_wait_time:.1f}s...',
-                    throttle_duration_sec=1.0)
-            else:
-                # 原地爬升到巡航高度 (用当前位置, 不用_hover), 远离小车后再平飞RTH
-                px = self.vehicle_local_position.x
-                py = self.vehicle_local_position.y
-                if math.isnan(px) or math.isnan(py):
-                    px, py = self._hover_x, self._hover_y
-                self.set_target_position(px, py, self.takeoff_height)
-                self.get_logger().info(
-                    f'[PLATFORM_WAIT] 爬升中 Z={self.vehicle_local_position.z:.2f}→{self.takeoff_height:.1f}...',
-                    throttle_duration_sec=1.0)
-                if abs(self.vehicle_local_position.z - self.takeoff_height) < 0.3:
-                    self.get_logger().info('PLATFORM_WAIT → RTH (到达巡航高度, 通知小车恢复)')
-                    msg = Int32(); msg.data = 1
-                    self.car_resume_pub.publish(msg)
-                    self._platform_enter_time = None
-                    self.state = FlightState.RTH
-
-        # ============================
-        # DONE: 任务完成, 持续发 Z=0 确保 offboard_control 走 land→disarm
-        # ============================
-        elif self.state == FlightState.DONE:
-            # 模式2持续确保小车恢复速度
-            if self._car_mode == 2:
-                msg = Int32(); msg.data = 1
-                self.car_resume_pub.publish(msg)
-                land_x, land_y = self.mode2_land_x, self.mode2_land_y
-            else:
-                land_x, land_y = self.rth_offset_x, self.rth_offset_y
-            self._car_mode = 0  # 清零防循环
-            self.get_logger().info(
-                '[DONE] 持续发送 Z=0, 等待 PX4 落地锁桨...',
-                throttle_duration_sec=3.0)
-            self.set_target_position(land_x, land_y, 0.0)
 
 
 def main(args=None):
@@ -831,12 +471,10 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("用户终止节点.")
+        print("终止.")
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
