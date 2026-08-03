@@ -56,7 +56,7 @@ class TFTrackingNode(Node):
 
         # ====== 参数 ======
         self.declare_parameter('takeoff_height', -1.2)
-        self.declare_parameter('arrival_threshold', 0.05)
+        self.declare_parameter('arrival_threshold', 0.15)
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('lost_timeout', 2.0)
         self.declare_parameter('search_timeout', 10.0)
@@ -255,7 +255,7 @@ class TFTrackingNode(Node):
     def check_arrived_2d(self, x, y):
         pos = self.vehicle_local_position
         if math.isnan(pos.x) or math.isnan(pos.y): return False
-        return math.hypot(pos.x - x, pos.y - y) < self.arrival_threshold
+        return math.hypot(pos.x - x, pos.y - y) < 0.05
 
     # ==================== 辅助 ====================
     def _reset_tracking_counters(self):
