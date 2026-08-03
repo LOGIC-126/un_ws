@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-TF 小车追踪节点 (仅保留模式1：跟踪抛投，模式2接口保留但已禁用)
+TF 小车追踪节点 (模式1 + 模式2 非阻塞等待)
 
 通过 TF2 监听小车 map→car_base_link 变换，计算小车相对无人机的 NED 偏移，
-驱动无人机追踪小车并执行抛投。
+驱动无人机追踪小车并执行任务。
 
-状态机: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND → DONE (全自动, 无需RC)
+状态机:
+  模式1: INIT → TAKEOFF → WAIT ⇄ TRACK ⇄ LOST → DROP → RTH → LAND → DONE
+  模式2: INIT → (FS_M2.TAKEOFF) → TRACKLAND → FLIGHT_AGINE → LEAVE_CAR → RTH → LAND → DONE
 """
 
 import math
@@ -21,7 +23,6 @@ from enum import Enum
 import tf2_ros
 from tf2_ros import TransformException
 from tf2_msgs.msg import TFMessage
-import tf_transformations
 
 from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
 from std_msgs.msg import Int32
@@ -36,45 +37,45 @@ class FlightState(Enum):
     TRACK = 3
     LOST = 4
     DROP = 5
-    RTH = 6          # Return To Home 返航
-    LAND = 7         # 降落
-    DONE = 8         # 任务完成
-    # 模式2状态已剔除：PLATFORM_WAIT, DEPART
+    RTH = 6
+    LAND = 7
+    DONE = 8
+
+class FS_M2(Enum):
+    TAKEOFF = 0
+    TRACKLAND = 1
+    FLIGHT_AGINE = 2
+    LEAVE_CAR = 3
+    RTH = 4
+    LAND = 5
 
 
 class TFTrackingNode(Node):
-    """TF 小车追踪节点: TF2 监听 + 状态机驱动, 追踪小车（仅模式1）"""
-
     def __init__(self):
         super().__init__('tf_tracking_node')
 
-        # ====== 参数声明 (仅模式1相关) ======
+        # ====== 参数 ======
         self.declare_parameter('takeoff_height', -1.2)
-        self.declare_parameter('arrival_threshold', 0.3)
+        self.declare_parameter('arrival_threshold', 0.05)
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('lost_timeout', 2.0)
         self.declare_parameter('search_timeout', 10.0)
         self.declare_parameter('drop_distance_threshold', 0.5)
         self.declare_parameter('drop_dwell_time', 3.0)
 
-        # —— TF 帧配置 ——
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('drone_frame', 'base_link')
         self.declare_parameter('car_frame', 'base_footprint')
 
-        # —— 小车 odom→map 偏移 ——
         self.declare_parameter('car.offset_x', 0.6)
         self.declare_parameter('car.offset_y', -0.36)
 
-        # —— 追踪参数 ——
         self.declare_parameter('max_distance', 15.0)
         self.declare_parameter('close_descent', 0.25)
-
-        # 模式1 返航/降落点
         self.declare_parameter('rth_offset_x', -0.15)
         self.declare_parameter('rth_offset_y', 0.0)
 
-        # 读取参数值
+        # 读取参数
         self.takeoff_height = self.get_parameter('takeoff_height').value
         self.arrival_threshold = self.get_parameter('arrival_threshold').value
         self.confirm_frames = self.get_parameter('confirm_frames').value
@@ -97,7 +98,7 @@ class TFTrackingNode(Node):
         self.car_offset_y = self.get_parameter('car.offset_y').value
         self.max_distance = self.get_parameter('max_distance').value
 
-        # ====== TF2 监听器 ======
+        # TF2 监听
         self.tf_buffer = tf2_ros.Buffer()
         for topic in ('/tf', '/tf_static', '/car/tf', '/car/tf_static'):
             self.create_subscription(
@@ -106,35 +107,31 @@ class TFTrackingNode(Node):
                              for t in msg.transforms],
                 100)
 
-        # ====== QoS ======
-        qos_profile = QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
-        # ====== 发布器 ======
-        self.target_position_pub = self.create_publisher(
-            Pose, '/uav/target_position', qos_profile)
-        self.drop_complete_pub = self.create_publisher(
-            Int32, '/car/drop_complete', 10)
-        self.car_resume_pub = self.create_publisher(
-            Int32, '/car/resume', 10)         # 模式1 状态→小车
+        # 发布器
+        self.target_position_pub = self.create_publisher(Pose, '/uav/target_position', qos)
+        self.drop_complete_pub = self.create_publisher(Int32, '/car/drop_complete', 10)
+        self.car_resume_pub = self.create_publisher(Int32, '/car/resume', 10)
 
-        # ====== 订阅器 ======
+        # 订阅器
         self.vehicle_local_pos_sub = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1',
-            self.vehicle_local_position_callback, qos_profile)
+            self.vehicle_local_position_callback, qos)
         self.vehicle_status_sub = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v2',
-            self.vehicle_status_callback, qos_profile)
+            self.vehicle_status_callback, qos)
 
         self._car_mode = 0
         self.car_trigger_sub = self.create_subscription(
             Int32, '/car/trigger', self._car_trigger_callback, 10)
 
-        # ====== 状态变量 ======
+        # 状态变量
         self.vehicle_status = VehicleStatus()
         self.vehicle_local_position = VehicleLocalPosition()
         self.state = FlightState.INIT
@@ -148,8 +145,10 @@ class TFTrackingNode(Node):
         self._drop_enter_time = None
         self._drop_servo_done = False
         self._land_stage = 0
-
         self._car_resume_sent = False
+
+        # 模式2 专用
+        self._flight_again_start = None      # 非阻塞等待计时器
 
         # 舵机
         self.servo_serial = None
@@ -167,22 +166,20 @@ class TFTrackingNode(Node):
         self.target_yaw = 0.0
 
         self.timer = self.create_timer(0.05, self.timer_callback)
-        self.get_logger().info(
-            "TF追踪节点已启动 | 仅支持模式1（跟踪抛投）| "
-            f"map={self.map_frame} | drone={self.drone_frame} | car={self.car_frame} | "
-            f"起飞高度={self.takeoff_height}m | 最大距离={self.max_distance}m"
-        )
+        self.get_logger().info("TF追踪节点已启动 | 模式1+模式2 | 非阻塞等待已启用")
 
-    # ==================== 订阅回调 ====================
+    # ==================== 回调 ====================
     def vehicle_local_position_callback(self, msg): self.vehicle_local_position = msg
     def vehicle_status_callback(self, msg): self.vehicle_status = msg
 
     def _car_trigger_callback(self, msg):
         if msg.data == 1 and self._car_mode == 0:
             self._car_mode = 1
-            self.get_logger().info('收到小车触发 → 模式1（跟踪抛投）')
-        elif msg.data == 2:
-            self.get_logger().warn('收到模式2触发指令，但当前固件已禁用模式2，忽略')
+            self.get_logger().info('收到触发 → 模式1（跟踪抛投）')
+        elif msg.data == 2 and self._car_mode == 0:
+            self._car_mode = 2
+            self.state = FS_M2.TAKEOFF        # 立即切换到模式2初始状态
+            self.get_logger().info('收到触发 → 模式2（跟踪起降）')
 
     # ==================== 舵机 ====================
     def _servo_cmd(self, data):
@@ -224,7 +221,6 @@ class TFTrackingNode(Node):
         if math.isnan(drone.x) or math.isnan(drone.y): return None
         return (drone.x + delta_x, drone.y - delta_y)
 
-    # ==================== 目标获取 ====================
     def _get_target_ned(self):
         car = self._lookup_car_ned()
         if car is None: return None
@@ -256,6 +252,11 @@ class TFTrackingNode(Node):
         if math.isnan(pos.x) or math.isnan(pos.y) or math.isnan(pos.z): return False
         return math.hypot(pos.x - x, pos.y - y, pos.z - z) < self.arrival_threshold
 
+    def check_arrived_2d(self, x, y):
+        pos = self.vehicle_local_position
+        if math.isnan(pos.x) or math.isnan(pos.y): return False
+        return math.hypot(pos.x - x, pos.y - y) < self.arrival_threshold
+
     # ==================== 辅助 ====================
     def _reset_tracking_counters(self):
         self._car_detection_count = 0; self._lost_start_time = None; self._search_start_time = None
@@ -275,56 +276,49 @@ class TFTrackingNode(Node):
         if (now - self._last_log_time).nanoseconds * 1e-9 < 2.0: return
         self._last_log_time = now
         drone = self.vehicle_local_position
-        state_name = self.state.name
+        state_name = self.state.name if hasattr(self.state, 'name') else str(self.state)
         car = self._lookup_car_ned()
         if car is not None:
             dx = car[0] - drone.x; dy = car[1] - drone.y; dist = math.hypot(dx, dy)
-            drop_hint = ""
-            if self.state == FlightState.TRACK and self._drop_start_time is not None:
-                dwell = (now - self._drop_start_time).nanoseconds * 1e-9
-                drop_hint = f" | 抛投倒计时 {dwell:.1f}s/{self.drop_dwell_time}s"
-            elif self.state == FlightState.DROP:
-                drop_hint = f" | 抛投执行中 Z={self.drop_height:.1f}m"
             self.get_logger().info(
                 f"[{state_name}] 无人机({drone.x:.2f},{drone.y:.2f},{drone.z:.2f}) | "
-                f"小车({car[0]:.2f},{car[1]:.2f}) | 距离={dist:.2f}m{drop_hint}")
+                f"小车({car[0]:.2f},{car[1]:.2f}) | 距离={dist:.2f}m")
         else:
             self.get_logger().info(
                 f"[{state_name}] 无人机({drone.x:.2f},{drone.y:.2f},{drone.z:.2f}) | 小车:未检测到")
 
     # ==================== 状态机顶层分发 ====================
     def run_state_machine(self):
-        # 公共状态：INIT（等待触发）
+        # 公共状态：INIT
         if self.state == FlightState.INIT:
             self.set_target_position(0.0, 0.0, 0.0)
             if self._car_mode == 1:
                 self.get_logger().info("INIT → TAKEOFF (模式1)")
                 self.set_target_position(0.0, 0.0, self.takeoff_height)
                 self.state = FlightState.TAKEOFF
+            elif self._car_mode == 2:
+                # 模式2已在回调中设置 FS_M2.TAKEOFF，这里无需处理
+                pass
             else:
-                self.get_logger().info("等待小车 /car/trigger (模式1) ...", throttle_duration_sec=3.0)
+                self.get_logger().info("等待小车触发...", throttle_duration_sec=3.0)
 
-        # 公共状态：DONE（任务结束）
+        # 公共状态：DONE
         elif self.state == FlightState.DONE:
-            self._car_mode = 0  # 确保重置
+            self._car_mode = 0
             self.get_logger().info('[DONE] 等待锁桨...', throttle_duration_sec=3.0)
             self.set_target_position(self.rth_offset_x, self.rth_offset_y, 0.0)
 
-        # 模式特定状态
         else:
-            if self._car_mode == 1:
+            if self._car_mode == 1 and isinstance(self.state, FlightState):
                 self._run_mode1_state_machine()
-            elif self._car_mode == 2:
-                # 模式2接口保留，暂不实现
-                pass
+            elif self._car_mode == 2 and isinstance(self.state, FS_M2):
+                self._run_mode2_state_machine()
             else:
-                # 异常情况：模式已清零但状态未归位，强制回 INIT
-                self.get_logger().warn('状态异常：模式为0但状态非INIT/DONE，强制返回INIT')
+                self.get_logger().warn('状态异常，强制回 INIT')
                 self.state = FlightState.INIT
 
-    # ==================== 模式1 状态机 ====================
+    # ==================== 模式1 状态机（不变） ====================
     def _run_mode1_state_machine(self):
-        # TAKEOFF
         if self.state == FlightState.TAKEOFF:
             self.set_target_position(0.0, 0.0, self.takeoff_height)
             if self.check_arrived(0.0, 0.0, self.takeoff_height):
@@ -336,7 +330,6 @@ class TFTrackingNode(Node):
                 self.car_resume_pub.publish(Int32(data=0))
                 self.state = FlightState.WAIT
 
-        # WAIT
         elif self.state == FlightState.WAIT:
             self.set_target_position(self._hover_x, self._hover_y, self.takeoff_height)
             if self._wait_start_time is not None:
@@ -357,7 +350,6 @@ class TFTrackingNode(Node):
                     self._car_resume_sent = False
                     self.state = FlightState.TRACK
 
-        # TRACK
         elif self.state == FlightState.TRACK:
             target = self._get_target_ned()
             if target is not None:
@@ -365,12 +357,9 @@ class TFTrackingNode(Node):
                 self._locked_target = (ned_x, ned_y)
                 if self._lost_start_time is not None:
                     self.get_logger().info("目标重新出现"); self._lost_start_time = None
-
                 close_ratio = max(0.0, 1.0 - dist / self.drop_distance_threshold)
                 track_z = self.takeoff_height + self.close_descent * close_ratio
                 self.set_target_position(ned_x, ned_y, track_z)
-
-                # 抛投检测
                 if dist < self.drop_distance_threshold:
                     if self._drop_start_time is None:
                         self._drop_start_time = self.get_clock().now()
@@ -381,7 +370,7 @@ class TFTrackingNode(Node):
                     else:
                         dwell = (self.get_clock().now() - self._drop_start_time).nanoseconds * 1e-9
                         if dwell >= self.drop_dwell_time:
-                            self.get_logger().info(f'TRACK → DROP (dist={dist:.2f}m, dwell={dwell:.1f}s)')
+                            self.get_logger().info(f'TRACK → DROP')
                             self.car_resume_pub.publish(Int32(data=2))
                             self._drop_start_time = None
                             self._drop_enter_time = self.get_clock().now()
@@ -397,7 +386,6 @@ class TFTrackingNode(Node):
                 elif self._locked_target is not None:
                     self.set_target_position(*self._locked_target, self.takeoff_height)
 
-        # LOST
         elif self.state == FlightState.LOST:
             if self._locked_target is not None:
                 self.set_target_position(*self._locked_target, self.takeoff_height)
@@ -406,7 +394,7 @@ class TFTrackingNode(Node):
                 self._car_detection_count += 1
                 if self._car_detection_count >= self.confirm_frames:
                     ned_x, ned_y, dist = target
-                    self.get_logger().info(f"LOST → TRACK (重新锁定 dist={dist:.2f}m)")
+                    self.get_logger().info(f"LOST → TRACK")
                     self._locked_target = (ned_x, ned_y); self._reset_tracking_counters()
                     self.state = FlightState.TRACK; return
             else: self._car_detection_count = 0
@@ -415,7 +403,6 @@ class TFTrackingNode(Node):
                 self._record_hover_position(); self._reset_tracking_counters()
                 self._locked_target = None; self.state = FlightState.WAIT
 
-        # DROP
         elif self.state == FlightState.DROP:
             if self._drop_enter_time is None: self._drop_enter_time = self.get_clock().now()
             target = self._get_target_ned()
@@ -438,10 +425,8 @@ class TFTrackingNode(Node):
             else:
                 self.get_logger().info(f'[DROP] 降高中 Z={curr_z:.2f}→{self.drop_height:.1f}...', throttle_duration_sec=1.0)
 
-        # RTH
         elif self.state == FlightState.RTH:
             rth_x, rth_y = self.rth_offset_x, self.rth_offset_y
-            self.get_logger().info(f'[RTH] 返航 ({rth_x:.2f},{rth_y:.2f})', throttle_duration_sec=2.0)
             self.set_target_position(rth_x, rth_y, self.takeoff_height)
             if self.check_arrived(rth_x, rth_y, self.takeoff_height):
                 self.get_logger().info('RTH → LAND')
@@ -449,7 +434,6 @@ class TFTrackingNode(Node):
                 self._land_stage = 0
                 self.state = FlightState.LAND
 
-        # LAND
         elif self.state == FlightState.LAND:
             land_x, land_y = self.rth_offset_x, self.rth_offset_y
             if self._land_stage == 0:
@@ -461,8 +445,59 @@ class TFTrackingNode(Node):
                 if self.vehicle_local_position.z >= -0.15:
                     self.get_logger().info('LAND → DONE')
                     self.car_resume_pub.publish(Int32(data=5))
-                    self._car_mode = 0   # 重置模式
+                    self._car_mode = 0
                     self.state = FlightState.DONE
+
+    # ==================== 模式2 状态机（非阻塞等待） ====================
+    def _run_mode2_state_machine(self):
+        if self.state == FS_M2.TAKEOFF:
+            self.set_target_position(0.0, 0.0, self.takeoff_height)
+            if self.check_arrived(0.0, 0.0, self.takeoff_height):
+                self.get_logger().info("TAKEOFF → TRACKLAND")
+                self.state = FS_M2.TRACKLAND
+                self.target_z = self.takeoff_height + 0.2
+
+        elif self.state == FS_M2.TRACKLAND:
+            target = self._get_target_ned()
+            self.set_target_position(target[0], target[1], self.target_z)
+            if self.check_arrived_2d(target[0], target[1]):
+                self.get_logger().info("DOWN !!")
+                if self.vehicle_local_position.z < 0.01:   # 尚未触地
+                    self.target_z += 0.2                  # 下降 (NED 中值增大)
+                else:
+                    self.get_logger().info("TRACKLAND → FLIGHT_AGINE")
+                    self.state = FS_M2.FLIGHT_AGINE
+                    self.target_z = self.takeoff_height
+                    self._flight_again_start = None       # 重置等待计时器
+
+        elif self.state == FS_M2.FLIGHT_AGINE:
+            # 非阻塞等待 3 秒，保持在小车水平位置、巡航高度
+            target = self._get_target_ned()
+            if self._flight_again_start is None:
+                self._flight_again_start = self.get_clock().now()
+            elapsed = (self.get_clock().now() - self._flight_again_start).nanoseconds * 1e-9
+            if elapsed < 3.0:
+                self.set_target_position(target[0], target[1], self.target_z)
+                self.get_logger().info(f'[FLIGHT_AGINE] 等待 {elapsed:.1f}s/3.0s', throttle_duration_sec=1.0)
+            else:
+                self.get_logger().info('FLIGHT_AGINE → RTH')
+                self.state = FS_M2.RTH
+
+        elif self.state == FS_M2.RTH:
+            rth_x, rth_y = self.rth_offset_x, self.rth_offset_y
+            self.set_target_position(rth_x, rth_y, self.takeoff_height)
+            if self.check_arrived(rth_x, rth_y, self.takeoff_height):
+                self.get_logger().info('RTH → LAND')
+                self.state = FS_M2.LAND
+
+        elif self.state == FS_M2.LAND:
+            land_x, land_y = self.rth_offset_x, self.rth_offset_y
+            self.set_target_position(land_x, land_y, 0.0)
+            # 直接判断高度触地，避免水平位置无法精准到达
+            if self.vehicle_local_position.z >= -0.15:
+                self.get_logger().info('LAND → DONE')
+                self._car_mode = 0
+                self.state = FlightState.DONE
 
 
 def main(args=None):
